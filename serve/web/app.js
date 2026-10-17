@@ -694,8 +694,18 @@ function markdown(text) {
 // ------------------------------------------------------------------ Chat
 // esp: the censorship switch - undefined follows the server's default (the config's "uncensored"), true/false is
 // the user's own pick.  espv 2: a pick saved by this version (an older one saved esp: true by itself)
-const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: undefined, mcp: true};
+// The sampling shown until the user changes it is the model card's thinking set. Untouched, the page sends NO sampling
+// fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
+// 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
+// values untouched counts as "not set" too.
+const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: undefined, mcp: true};
+const OLD_DEFAULT_TEMPERATURE = 0.6;
+function samplingUntouched(s) {
+  const t = +s.temperature;
+  return (t === DEFAULTS.temperature || t === OLD_DEFAULT_TEMPERATURE) && +s.top_p === DEFAULTS.top_p && +s.top_k === DEFAULTS.top_k;
+}
 let settings = (() => { const s = store.get("sampling", {}); if (s.espv !== 2) delete s.esp; return {...DEFAULTS, ...s}; })();
+if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 let messages = store.get("chat", []);
 let attachments = [];                 // {name, url}
 let busy = null;                      // {controller, msg}
@@ -924,10 +934,10 @@ async function send() {
 
   const body = {model: health.model, messages: apiMessages(), stream: true,
                 reasoning_effort: settings.thinking};
-  if (settings.temperature > 0) {
-    Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
-  } else {
+  if (!(settings.temperature > 0)) {
     body.temperature = 0;
+  } else if (!samplingUntouched(settings)) {
+    Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
   }
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
@@ -1145,8 +1155,9 @@ async function loadShared() {
   $("s-share").setAttribute("aria-checked", String(sharedOn));
 }
 function sharedDefaults(s) {
-  const d = {reasoning_effort: s.thinking, temperature: +s.temperature};
-  if (+s.temperature > 0) Object.assign(d, {top_p: +s.top_p, top_k: +s.top_k});
+  const d = {reasoning_effort: s.thinking};
+  if (!(+s.temperature > 0)) d.temperature = 0;
+  else if (!samplingUntouched(s)) Object.assign(d, {temperature: +s.temperature, top_p: +s.top_p, top_k: +s.top_k});
   if (s.seed) d.seed = +s.seed;
   if (s.max) d.max_tokens = +s.max;
   if (projectionLoaded() && s.esp != null) d.experimental_speed_projection = s.esp !== false;

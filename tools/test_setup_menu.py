@@ -138,7 +138,7 @@ class EnginePlaceholders(unittest.TestCase):
         self.assertGreaterEqual(setup.MIN_ENGINE, (0, 1, 44, 1))
         for m in ("UD-Q5_K_XL", "UD-Q6_K_XL"):
             self.assertEqual(setup.MODELS[m]["engine"], (0, 1, 44), m)
-        self.assertIn("0.1.44", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8").split("project(strata VERSION", 1)[1][:12])
+        self.assertIn("0.1.45", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8").split("project(strata VERSION", 1)[1][:12])
 
 
 class KqLibrary(unittest.TestCase):
@@ -165,6 +165,30 @@ class KqLibrary(unittest.TestCase):
             (tmp / setup.KQ_LIB).write_bytes(b"new kq")
             setup.install_unpacked(tmp, eng)
             self.assertEqual((eng / setup.KQ_LIB).read_bytes(), b"new kq")
+
+
+class ImageEncoderDefault(unittest.TestCase):
+    """#2406: "images: yes" gets the CPU encoder on an NVIDIA card under 24 GB (the GPU encoder cost 3-5% of text speed on
+    16 GB cards, 35-60% on an RTX 4080 SUPER under Windows); --vision gpu is kept with a note."""
+
+    def test_yes_follows_the_card(self):
+        f = setup.flash_vision_encoder
+        self.assertEqual(f("yes", {"vram_gb": 12.0}), "cpu")
+        self.assertEqual(f("yes", {"vram_gb": 15.9}), "cpu")
+        self.assertEqual(f("yes", {"vram_gb": 24.0}), "gpu")
+        self.assertEqual(f("yes", {"vram_gb": 32.0}), "gpu")
+        self.assertEqual(f("yes", {}), "gpu")                    # unknown VRAM: the old default
+        self.assertEqual(f("cpu", {"vram_gb": 32.0}), "cpu")
+        self.assertEqual(f("none", {"vram_gb": 16.0}), "none")
+
+    def test_gpu_asked_is_kept_with_a_note(self):
+        import contextlib, io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(setup.flash_vision_encoder("gpu", {"vram_gb": 16.0}), "gpu")
+            self.assertEqual(setup.flash_vision_encoder("gpu", {"vram_gb": 32.0}), "gpu")
+        self.assertEqual(out.getvalue().count("kept as you chose"), 1)
+        self.assertIn("#2406", out.getvalue())
 
 
 if __name__ == "__main__":

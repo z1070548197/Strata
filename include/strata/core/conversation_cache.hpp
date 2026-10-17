@@ -30,6 +30,16 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    // --prefill-pipe on a layer split: the plan a prompt segment [from, to) is read in - its chunk (0: none), the loan
+    // its buffers were laid out for (which experts the prompt reads in place and which it streams: that sets bits
+    // too), the pipe value it was planned with, whether it is one chunk and whether the plan changed the buffers'
+    // chunks.  A periodic checkpoint taken inside such a segment keeps it, so a read that goes on from there reads the
+    // rest in the same chunks with the same loan.  Run-time only, like `pinned` (a layer split saves no session files).
+    struct PromptPlan {
+        int64_t chunk = 0, from = -1, to = -1, lend = 0;
+        double pipe = 0.0;
+        bool single = false, chunked = false;
+    } plan;
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
@@ -430,6 +440,26 @@ public:
         return dropped;
     }
     size_t superseded() const { return superseded_; }
+    /// --conversation-cache-park-gain N: the longest parked entry this conversation's outgoing state supersedes, in
+    /// tokens, 0 when it has none.  It is the entry drop_superseded() would remove, so the caller can tell whether a
+    /// park now would only rewrite what a turn from now drops: the prefix such an entry holds is this conversation's
+    /// prefix, and the conversation only appends, so the copy stays usable for the reuse it was made for.
+    size_t parked_prefix_tokens(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+                                const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
+        size_t longest = 0;
+        for (const auto& e : entries_) {
+            if (e.cvec != cvec) continue;
+            const ConversationCheckpoint* deepest = nullptr;
+            for (const auto& c : e.checkpoints)
+                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+            if (!deepest || deepest->ids.empty()) continue;
+            bool holds = deepest->ids == ids && deepest->imgs == images;
+            for (const auto& k : checkpoints)
+                if (!holds && k.ids == deepest->ids && k.imgs == deepest->imgs) holds = true;
+            if (holds) longest = std::max(longest, deepest->ids.size());
+        }
+        return longest;
+    }
 
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();

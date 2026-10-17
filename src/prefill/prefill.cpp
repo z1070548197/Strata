@@ -1992,6 +1992,47 @@ void Prefill::set_ring_budget(int slots, int64_t small_max) {
 double Prefill::pinned_share() { return g_pinned_share; }
 int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
 
+namespace {
+double g_pipe = -1.0;
+double g_pipe_req = -1.0;
+
+double pipe_value() {
+    if (g_pipe_req >= 0.0) return g_pipe_req;
+    if (g_pipe >= 0.0) return g_pipe;
+    const char* v = std::getenv("STRATA_PREFILL_PIPE");
+    return v != nullptr && v[0] != '\0' ? std::max(0.0, std::atof(v)) : 0.0;
+}
+
+int64_t ratio_tokens(double value) {
+    return value > 0.0 ? (int64_t) std::llround(std::min(value, 1048576.0)) : 0;
+}
+}
+
+void Prefill::set_pipe(double value) { g_pipe = value; }
+void Prefill::set_pipe_request(double value) { g_pipe_req = value; }
+double Prefill::pipe_setting() { return pipe_value(); }
+int64_t Prefill::pipe_key(double value) { return value <= 0.0 ? -1 : value <= 1.0 ? 0 : ratio_tokens(value); }
+int Prefill::stage_count() const {
+    int stages = 1;
+    for (const Prefill* p = next_; p != nullptr; p = p->next_) ++stages;
+    return stages;
+}
+int64_t Prefill::pipeline_chunk(int64_t, int64_t cap, int, double) { return cap; }
+int64_t Prefill::plan_chunk(int64_t) const { return 0; }
+void Prefill::force_chunk(int64_t chunk, bool single, bool planned) {
+    force_chunk_ = chunk;
+    force_single_ = single;
+    force_planned_ = planned;
+}
+void Prefill::log_plan(int64_t, int64_t, int) {}
+int64_t Prefill::chain_experts_streamed() const {
+    int64_t total = 0;
+    for (const Prefill* p = this; p != nullptr; p = p->next_) total += p->stats_.experts_streamed;
+    return total;
+}
+size_t Prefill::slot_guard_bytes() { return mmq::direct_slot_guard(); }
+bool Prefill::reserve_uploads(int64_t) { return true; }
+
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
     return bytes_needed_impl(g, ss, chunk, false, src);
 }
