@@ -1,0 +1,637 @@
+From 25739694497ac44b525e271123b8653da817002f Mon Sep 17 00:00:00 2001
+From: zcc <1070548197@qq.cpm>
+Date: Fri, 30 Oct 2026 16:50:37 +0800
+Subject: [PATCH 2/2] port park async (f73b3c86) + ckpt async (0f7224d1)
+
+---
+ include/strata/core/conversation_buffer.hpp   |  23 ++-
+ include/strata/core/conversation_cache.hpp    |   4 +
+ include/strata/core/conversation_snapshot.hpp |  21 ++-
+ src/core/conversation_copy.hpp                |  44 ++++-
+ src/core/conversation_snapshot.cpp            | 171 +++++++++++++++++-
+ src/core/conversation_state.cpp               |  30 ++-
+ src/program/generate.cpp                      |  55 ++++++
+ sycl/src/core/conversation_state.cpp          |   4 +-
+ 8 files changed, 340 insertions(+), 12 deletions(-)
+
+diff --git a/include/strata/core/conversation_buffer.hpp b/include/strata/core/conversation_buffer.hpp
+index d8a45177..2ba8aaa6 100644
+--- a/include/strata/core/conversation_buffer.hpp
++++ b/include/strata/core/conversation_buffer.hpp
+@@ -7,6 +7,7 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <initializer_list>
++#include <memory>
+ #include <utility>
+ #include <vector>
+ 
+@@ -61,7 +62,8 @@ public:
+             (count > SIZE_MAX / sizeof(Segment) || !add(total, count * sizeof(Segment)))) return SIZE_MAX;
+         return total;
+     }
+-    void resize(size_t n, uint8_t value = 0) {
++    void resize(size_t n, uint8_t value = 0) { resize_impl(n, &value); }
++    void resize_impl(size_t n, const uint8_t* value) {
+         if (n > size_) {
+             const size_t held = size_;
+             const bool growing = held != 0;
+@@ -70,7 +72,8 @@ public:
+             const size_t extra = n - size_ - extend;
+             segments_.reserve(segments_.size() + extra / segment_bytes + (extra % segment_bytes != 0));
+             if (extend) {
+-                segments_.back().resize(segments_.back().size() + extend, value);
++                if (value) segments_.back().resize(segments_.back().size() + extend, *value);
++                else segments_.back().resize(segments_.back().size() + extend);
+                 size_ += extend;
+             }
+             while (size_ < n) {
+@@ -78,7 +81,8 @@ public:
+                 const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
+                 Segment segment;
+                 segment.reserve(segment_capacity(count, previous, growing, held));
+-                segment.resize(count, value);
++                if (value) segment.resize(count, *value);
++                else segment.resize(count);
+                 segments_.push_back(std::move(segment));
+                 size_ += count;
+                 progress_beat();   // #2049: zero-filling 16 MiB of fresh pages is slow when the host is paging
+@@ -93,6 +97,9 @@ public:
+         }
+     }
+     void pop_back() { resize(size_ - 1); }
++    // resize() without the zero fill of what it adds (the fresh pages are not touched here): only for a caller that
++    // writes every added byte before anything reads it (STRATA_PARK_ASYNC's background copy)
++    void resize_for_overwrite(size_t n) { resize_impl(n, nullptr); }
+ 
+     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.
+     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) {
+@@ -123,7 +130,15 @@ public:
+     }
+ 
+ private:
+-    using Segment = std::vector<uint8_t>;
++    // value-initializes only when asked (resize's explicit fill value): resize_for_overwrite leaves the bytes alone
++    template<class T> struct DefaultInit : std::allocator<T> {
++        template<class U> struct rebind { using other = DefaultInit<U>; };
++        DefaultInit() = default;
++        template<class U> DefaultInit(const DefaultInit<U>&) noexcept {}
++        template<class U> void construct(U* p) { ::new ((void*) p) U; }
++        template<class U, class... A> void construct(U* p, A&&... a) { ::new ((void*) p) U(std::forward<A>(a)...); }
++    };
++    using Segment = std::vector<uint8_t, DefaultInit<uint8_t>>;
+     // A fresh capture allocates exactly its payload. Later appends reserve
+     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
+     // extend the final allocation instead of adding one transfer per turn.
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index c8793ba7..d2804b50 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -10,6 +10,7 @@
+ #include <cstdint>
+ #include <deque>
+ #include <functional>
++#include <memory>
+ #include <utility>
+ #include <vector>
+ 
+@@ -180,6 +181,9 @@ struct SavedConversation {
+     // the disk tier's entry holding exactly this image (conversation_disk.hpp: written while the engine was idle), 0 =
+     // none.  A run-time mark only, not in the session file: an eviction then drops the RAM copy without a write.
+     uint64_t disk_id = 0;
++    // STRATA_PARK_ASYNC: set while a background copy fills this image's K/V; its deleter waits for that copy, and as
++    // the last member it runs before any buffer is freed (whichever copy of the image goes last)
++    std::shared_ptr<void> pending;
+ 
+     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
+     bool pinned() const {
+diff --git a/include/strata/core/conversation_snapshot.hpp b/include/strata/core/conversation_snapshot.hpp
+index 4091f0ef..16917b71 100644
+--- a/include/strata/core/conversation_snapshot.hpp
++++ b/include/strata/core/conversation_snapshot.hpp
+@@ -77,6 +77,19 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
+ /// when nothing is in flight.
+ /// `only` (non-null): wait only when the copy in flight is into that checkpoint's GDN bytes.
+ void conversation_checkpoint_join(const void* only = nullptr);
++/// STRATA_PARK_ASYNC: waits until the last parked image's K/V has landed in its host buffers (no-op otherwise); the
++/// readers of a parked image's K/V call it first, and the image itself before it frees them (SavedConversation::pending).
++void conversation_park_join();
++/// STRATA_PARK_ASYNC=1 (CUDA, opt-in): between begin and launch, conversation_kv_save copies the device K/V device to
++/// device into a VRAM stage (only while 1.5 GB of VRAM stays free beside it; else as before) and records where it
++/// goes; launch moves the stage into the host buffers on a background thread (4 MiB pieces through two pinned
++/// buffers), so the next prompt starts at once.  conversation_park_join (above) waits for it.
++/// begin: false when it is off (the saves then copy as before); `need` is the K/V bytes the saves will copy.
++bool conversation_park_async_begin(size_t need);
++/// The recorded copies start (the device copies into the stage have landed when it returns); false: a copy failed.
++bool conversation_park_async_launch(std::string& error);
++/// Abandons a begun park that was not launched (the error paths): nothing was queued to the background.
++void conversation_park_async_abandon();
+ bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
+                                      const ModelGeometry& g, std::string& error);
+ // conversation_checkpoint_save(from) + conversation_checkpoint_restore(to) of `ids` without a host image, for two
+@@ -140,9 +153,15 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
+ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const ConversationView& view,
+                                          const SessionState& session, const ModelGeometry& g, const QsaState* draft,
+                                          size_t& bytes, std::string& error);
++// `storage` (optional, STRATA_CKPT_POOL): dropped checkpoints whose vectors the image's running state and checkpoint
++// copies go into (their pages are in: no fresh pages to fault); the ones not used are left in it.
++// `moved` (optional): checkpoints the caller drops after this, moved into the image after the copies of the view's
++// (the image holds the same checkpoints as with all of them in the view; nothing is copied for these)
+ bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
+                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
+-                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
++                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
++                                std::vector<ConversationCheckpoint>* storage = nullptr,
++                                std::vector<ConversationCheckpoint>* moved = nullptr);
+ bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
+                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
+ ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
+diff --git a/src/core/conversation_copy.hpp b/src/core/conversation_copy.hpp
+index 0a65c4de..e9a98134 100644
+--- a/src/core/conversation_copy.hpp
++++ b/src/core/conversation_copy.hpp
+@@ -165,11 +165,51 @@ inline ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoi
+     return o;
+ }
+ 
+-inline std::vector<ConversationCheckpoint> copy_checkpoints_beating(const std::vector<ConversationCheckpoint>& cs) {
++/// copy_beating into `out`'s storage (its capacity kept: a vector whose pages are in takes the copy without faults)
++template<class V>
++inline void assign_beating(V& out, const V& src) {
++    out.clear();
++    out.reserve(src.size());
++    const size_t step = std::max<size_t>(1, ((size_t) 1 << 20) / sizeof(typename V::value_type));
++    for (size_t at = 0; at < src.size(); at += step) {
++        out.insert(out.end(), src.begin() + (std::ptrdiff_t) at,
++                   src.begin() + (std::ptrdiff_t) std::min(src.size(), at + step));
++        if (const long us = test_slow_copy_us(); us > 0) std::this_thread::sleep_for(std::chrono::microseconds(us));
++        core::progress_beat();
++    }
++}
++
++/// copy_checkpoint_beating into `o`, a dropped checkpoint's storage (STRATA_CKPT_POOL): the same bytes
++inline void copy_checkpoint_into(ConversationCheckpoint& o, const ConversationCheckpoint& c) {
++    assign_beating(o.ids, c.ids);
++    assign_beating(o.imgs, c.imgs);
++    assign_beating(o.gdn, c.gdn);
++    o.dev_tag = c.dev_tag;
++    assign_beating(o.ple, c.ple);
++    assign_beating(o.tails, c.tails);
++    assign_beating(o.dead, c.dead);
++    assign_beating(o.block_pos, c.block_pos);
++    o.used = c.used;
++    o.pinned = c.pinned;
++    o.stage_parts.clear();
++    for (const auto& part : c.stage_parts) o.stage_parts.push_back(copy_checkpoint_beating(part));
++}
++
++/// `storage` (optional): dropped checkpoints whose vectors the copies go into, taken from its back while it lasts
++inline std::vector<ConversationCheckpoint> copy_checkpoints_beating(const std::vector<ConversationCheckpoint>& cs,
++                                                                    std::vector<ConversationCheckpoint>* storage = nullptr) {
+     for (const auto& c : cs) core::conversation_checkpoint_join(c.gdn.data());
+     std::vector<ConversationCheckpoint> out;
+     out.reserve(cs.size());
+-    for (const auto& c : cs) out.push_back(copy_checkpoint_beating(c));
++    for (const auto& c : cs) {
++        if (storage != nullptr && !storage->empty()) {
++            out.push_back(std::move(storage->back()));
++            storage->pop_back();
++            copy_checkpoint_into(out.back(), c);
++        } else {
++            out.push_back(copy_checkpoint_beating(c));
++        }
++    }
+     return out;
+ }
+ 
+diff --git a/src/core/conversation_snapshot.cpp b/src/core/conversation_snapshot.cpp
+index 76e69b5f..b9967651 100644
+--- a/src/core/conversation_snapshot.cpp
++++ b/src/core/conversation_snapshot.cpp
+@@ -5,9 +5,13 @@
+ #include <cuda_runtime.h>
+ 
+ #include <array>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <future>
+ #include <limits>
+ #include <memory>
++#include <mutex>
+ 
+ namespace strata::core {
+ namespace {
+@@ -110,6 +114,39 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
+     return true;
+ }
+ 
++struct ParkAsync {
++    std::mutex mu;
++    std::future<cudaError_t> pending;
++    struct Item { uint8_t* dst; size_t n, at; };
++    std::vector<Item> items;
++    uint8_t* stage = nullptr;
++    size_t cap = 0, used = 0;
++    void* host[2] = {nullptr, nullptr};   // pinned, 4 MiB each
++    cudaStream_t stream = nullptr;
++    int dev = -1;
++    bool active = false;
++};
++ParkAsync& park_async() { static ParkAsync a; return a; }
++constexpr size_t kParkPiece = (size_t) 4 << 20;
++bool park_async_on() {
++#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
++    return false;
++#else
++    static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
++    return on;
++#endif
++}
++bool on_device(const void* p) {
++#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
++    (void) p;   // (no pointer-attribute query in the shims: the slot takes no part, as when the query fails)
++    return false;
++#else
++    cudaPointerAttributes at{};
++    if (cudaPointerGetAttributes(&at, p) != cudaSuccess) { cudaGetLastError(); return false; }
++    return at.type == cudaMemoryTypeDevice;
++#endif
++}
++
+ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
+     if (!n) return true;
+     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
+@@ -171,9 +208,20 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
+         const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
+                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
+         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
+-        dst[i]->resize(sizes[i]);
++        // STRATA_PARK_ASYNC: device bytes go to the VRAM stage now and into the buffer on the background thread
++        ParkAsync& a = park_async();
++        const bool staged = a.active && src[i] != nullptr && sizes[i] > keep && a.used + (sizes[i] - keep) <= a.cap &&
++                            on_device(src[i]);
++        if (staged) dst[i]->resize_for_overwrite(sizes[i]);
++        else dst[i]->resize(sizes[i]);
+         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
+-                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
++                const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
++                if (!staged) return transfer(p, s, n, error);
++                const cudaError_t e = conversation_detail::copy_nonblocking(a.stage + a.used, s, n, true);
++                if (e != cudaSuccess) { error = std::string("conversation snapshot stage copy: ") + cudaGetErrorString(e); return false; }
++                a.items.push_back({p, n, a.used});
++                a.used += n;
++                return true;
+             })) return false;
+         if (reused_bytes) *reused_bytes += keep;
+     }
+@@ -253,6 +301,7 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
+ 
+ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                              int64_t upto, bool index, std::string& error) {
++    conversation_park_join();
+     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+     const auto dst = pools(st);
+@@ -265,6 +314,7 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
+ 
+ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                                     int64_t captured, int64_t upto, bool index, std::string& error) {
++    conversation_park_join();
+     if (upto < 0 || upto > captured) {
+         error = "conversation snapshot: prefix beyond the captured K/V";
+         return false;
+@@ -314,6 +364,7 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
+ 
+ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                             int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
++    conversation_park_join();
+     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+     std::array<uint8_t, 65536> buffer;
+     uint64_t hash = 1469598103934665603ull;
+@@ -355,4 +406,120 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
+     return true;
+ }
+ 
++void conversation_park_join() {
++    ParkAsync& a = park_async();
++    std::lock_guard<std::mutex> lk(a.mu);
++    if (a.pending.valid()) {
++        const cudaError_t e = a.pending.get();
++        if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s)\n", cudaGetErrorString(e));
++    }
++}
++
++bool conversation_park_async_begin(size_t need) {
++    conversation_park_join();   // (the stage is reused)
++    ParkAsync& a = park_async();
++    a.active = false;
++    a.items.clear();
++    a.used = 0;
++    if (!park_async_on() || need == 0) return false;
++    int dev = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
++    if (a.stage != nullptr && (a.cap < need || a.dev != dev)) {
++        const int cur = dev;
++        (void) cudaSetDevice(a.dev); (void) cudaFree(a.stage); (void) cudaSetDevice(cur);
++        a.stage = nullptr; a.cap = 0;
++    }
++    if (a.stream != nullptr && a.dev != dev) {
++        const int cur = dev;
++        (void) cudaSetDevice(a.dev); (void) cudaStreamDestroy(a.stream);
++        (void) cudaFreeHost(a.host[0]); (void) cudaFreeHost(a.host[1]); (void) cudaSetDevice(cur);
++        a.stream = nullptr; a.host[0] = a.host[1] = nullptr;
++    }
++    a.dev = dev;
++    if (a.stream == nullptr &&
++        (cudaStreamCreateWithFlags(&a.stream, cudaStreamNonBlocking) != cudaSuccess ||
++         cudaMallocHost(&a.host[0], kParkPiece) != cudaSuccess || cudaMallocHost(&a.host[1], kParkPiece) != cudaSuccess)) {
++        if (a.host[0]) (void) cudaFreeHost(a.host[0]);
++        if (a.host[1]) (void) cudaFreeHost(a.host[1]);
++        if (a.stream) (void) cudaStreamDestroy(a.stream);
++        a.stream = nullptr; a.host[0] = a.host[1] = nullptr;
++        (void) cudaGetLastError();
++        return false;
++    }
++    if (a.stage == nullptr) {
++        size_t fr = 0, tot = 0;
++        if (cudaMemGetInfo(&fr, &tot) != cudaSuccess || fr < need + ((size_t) 3 << 29) ||
++            cudaMalloc((void**) &a.stage, need) != cudaSuccess) {
++            a.stage = nullptr;
++            (void) cudaGetLastError();
++            return false;
++        }
++        a.cap = need;
++    }
++    a.active = true;
++    return true;
++}
++
++void conversation_park_async_abandon() {
++    ParkAsync& a = park_async();
++    if (!a.active) return;
++    a.active = false;
++    a.items.clear();
++    cudaStream_t s = nullptr;
++    if (conversation_detail::private_stream(s) == cudaSuccess) (void) cudaStreamSynchronize(s);   // nothing reads the stage after
++    (void) cudaGetLastError();
++}
++
++bool conversation_park_async_launch(std::string& error) {
++    ParkAsync& a = park_async();
++    if (!a.active) return true;
++    a.active = false;
++    cudaStream_t s = nullptr;
++    cudaError_t e = conversation_detail::private_stream(s);
++    if (e == cudaSuccess) e = cudaStreamSynchronize(s);   // the device-to-device copies into the stage
++    if (e != cudaSuccess) {
++        a.items.clear();
++        error = std::string("conversation snapshot stage: ") + cudaGetErrorString(e);
++        return false;
++    }
++    if (a.items.empty()) return true;
++    std::vector<ParkAsync::Item> items;
++    items.swap(a.items);
++    const uint8_t* stage = a.stage;
++    void* host[2] = {a.host[0], a.host[1]};
++    cudaStream_t st = a.stream;
++    const int dev = a.dev;
++    std::lock_guard<std::mutex> lk(a.mu);
++    // two pinned pieces in turn: the next piece's DMA runs while this one is copied into its segment
++    a.pending = std::async(std::launch::async, [items = std::move(items), stage, host, st, dev] {
++        (void) cudaSetDevice(dev);
++        cudaEvent_t done[2] = {nullptr, nullptr};
++        cudaError_t e = cudaEventCreateWithFlags(&done[0], cudaEventDisableTiming | cudaEventBlockingSync);
++        if (e == cudaSuccess) e = cudaEventCreateWithFlags(&done[1], cudaEventDisableTiming | cudaEventBlockingSync);
++        struct Piece { uint8_t* dst; size_t n; };
++        Piece held[2] = {{nullptr, 0}, {nullptr, 0}};
++        int b = 0;
++        auto land = [&](int k) {
++            if (held[k].dst == nullptr || e != cudaSuccess) return;
++            e = cudaEventSynchronize(done[k]);
++            if (e == cudaSuccess) std::memcpy(held[k].dst, host[k], held[k].n);
++            held[k] = {nullptr, 0};
++        };
++        for (const auto& it : items)
++            for (size_t o = 0; e == cudaSuccess && o < it.n; o += kParkPiece) {
++                const size_t n = std::min(kParkPiece, it.n - o);
++                land(b);
++                if (e == cudaSuccess) e = cudaMemcpyAsync(host[b], stage + it.at + o, n, cudaMemcpyDeviceToHost, st);
++                if (e == cudaSuccess) e = cudaEventRecord(done[b], st);
++                if (e == cudaSuccess) held[b] = {it.dst + o, n};
++                b ^= 1;
++            }
++        land(b);
++        land(b ^ 1);
++        for (cudaEvent_t d : done) if (d) (void) cudaEventDestroy(d);
++        return e;
++    });
++    return true;
++}
++
+ } // namespace strata::core
+diff --git a/src/core/conversation_state.cpp b/src/core/conversation_state.cpp
+index 31f987cc..1ae20a88 100644
+--- a/src/core/conversation_state.cpp
++++ b/src/core/conversation_state.cpp
+@@ -433,8 +433,11 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
+ bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
+                                 const SessionState& ss, const ModelGeometry& g,
+                                 const QsaState* draft, std::string& error,
+-                                ConversationKvReuse reuse, size_t* reused_bytes) {
++                                ConversationKvReuse reuse, size_t* reused_bytes,
++                                std::vector<ConversationCheckpoint>* storage,
++                                std::vector<ConversationCheckpoint>* moved) {
+     conversation_checkpoint_join(nullptr);
++    conversation_park_join();
+     static const bool ptr = std::getenv("STRATA_PARK_TRACE") != nullptr;
+     auto now = [] { return std::chrono::steady_clock::now(); };
+     auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+@@ -446,9 +449,19 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
+     SavedConversation captured;
+     captured.geometry = geometry_key(g);
+     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
++    if (storage != nullptr && !storage->empty()) {   // the running state into a dropped checkpoint's vectors
++        captured.live = std::move(storage->back());
++        storage->pop_back();
++        captured.live.stage_parts.clear();
++    }
+     captured.live.ids = view.ids; captured.live.imgs = view.images;
+     const auto p1 = now();
+-    captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints);
++    captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints, storage);
++    if (moved != nullptr)
++        for (auto& c : *moved) {
++            conversation_checkpoint_join(c.gdn.data());
++            captured.checkpoints.push_back(std::move(c));
++        }
+     const auto p2 = now();
+     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
+     captured.kv = std::move(reuse.kv);
+@@ -457,6 +470,12 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
+     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
+     const auto p3 = now();
+     const int64_t upto = (int64_t) view.ids.size();
++    // STRATA_PARK_ASYNC: the K/V bytes these saves copy (the stage they need; an over-estimate by the kept prefix)
++    size_t kv_need = 0;
++    for (size_t j = 0; j < layers; ++j) kv_need += conversation_kv_bytes(owned(ss, j), g, upto, true);
++    if (draft) kv_need += conversation_kv_bytes(*draft, g, upto, false);
++    const bool staged = conversation_park_async_begin(kv_need);
++    struct Abandon { bool on; ~Abandon() { if (on) conversation_park_async_abandon(); } } abandon{staged};
+     for (size_t j = 0; j < layers; ++j)
+         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
+                                   unchanged, reused_bytes)) return false;
+@@ -470,6 +489,9 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
+     // reached. Refresh that page even when the main prefix continued unchanged.
+     if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
+                                        std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
++    abandon.on = false;
++    if (staged && !conversation_park_async_launch(error)) return false;
++    if (staged) captured.pending = std::shared_ptr<void>(new char, [](void* p) { conversation_park_join(); delete (char*) p; });
+     image = std::move(captured);
+     return true;
+ }
+@@ -556,6 +578,7 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
+                                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
+     conversation_checkpoint_join(image.live.gdn.data());
+     for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
++    conversation_park_join();
+     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
+     if (!sync(error)) return ConversationRestore::transfer_failed;
+     const int64_t upto = (int64_t) image.live.ids.size();
+@@ -592,6 +615,7 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
+                                                    const ModelGeometry& g, const QsaState& draft, std::string& error) {
+     conversation_checkpoint_join(image.live.gdn.data());
+     for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
++    conversation_park_join();
+     return conversation_snapshot_restore(image, ss, g, &draft, error);
+ }
+ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
+@@ -599,6 +623,7 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
+                                                           const QsaState& draft, std::string& error) {
+     conversation_checkpoint_join(image.live.gdn.data());
+     for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
++    conversation_park_join();
+     return conversation_snapshot_restore_prefix(image, upto, ss, g, &draft, error);
+ }
+ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
+@@ -606,6 +631,7 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
+                                                           const QsaState* draft, std::string& error) {
+     conversation_checkpoint_join(image.live.gdn.data());
+     for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
++    conversation_park_join();
+     // a layer split's image (stage images) is restored stage by stage, never in part
+     if (!image.stage_images.empty()) {
+         fail(error, "a layer split's image restored as a single session");
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index f12654ff..8efffc75 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -208,6 +208,10 @@ bool admit_merge_first_env() {
+ // checkpoints it drops (evicted, pruned, a batch slot's old one) and saves the next checkpoint into them, so a save
+ // resizes nothing (no zero-fill of ~118 MB of fresh vectors) and a slot's copy reuses their pages.  Every byte is
+ // overwritten by the copy, so the checkpoints are the same
++bool park_async_env() {   // STRATA_PARK_ASYNC (strata/core/conversation_snapshot.hpp)
++    static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
++    return on;
++}
+ bool ckpt_pool_env() {
+     static const bool on = [] {
+         const char* v = std::getenv("STRATA_CKPT_POOL");
+@@ -10748,6 +10752,10 @@ int main(int argc, char** argv) {
+         };
+         // Save only on a switch/rewind, not on each continuing request. No graph
+         // addresses change: all parked images live in ordinary host vectors.
++        // STRATA_PARK_ASYNC: set by the request around its park - the live checkpoints it drops right after (they move
++        // into the parked image instead of being copied); a background allocation then refills STRATA_CKPT_POOL
++        std::function<bool(const ConvCheckpoint&)> park_drops;
++        std::future<void> pool_refill;
+         auto park_current_body = [&](size_t held) -> bool {
+             if (!conversations.enabled() || !live_ok || live.empty()) return true;
+             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
+@@ -10880,6 +10888,39 @@ int main(int argc, char** argv) {
+                                  (long long) o.conversation_cache_min_free_mib);
+                 strata::core::SavedConversation image;
+                 size_t reused_bytes = 0;
++                // STRATA_CKPT_POOL: the running state and the checkpoint copies go into dropped checkpoints' vectors
++                // (the ones this request drops refill the pool right after); what is left goes back
++                std::vector<ConvCheckpoint> storage;
++                if (ckpt_pool.on() && n_st == 0)
++                    for (size_t k = 0; k <= view.checkpoints.size(); ++k) {
++                        ConvCheckpoint c = ckpt_pool.take();
++                        if (c.gdn.empty()) break;
++                        storage.push_back(std::move(c));
++                    }
++                std::vector<ConvCheckpoint> moved;   // STRATA_PARK_ASYNC: the ones this request drops (view: the rest)
++                if (park_drops && n_st == 0 && src.with_reuse) {   // (the main session's checkpoints only, not an idle slot's)
++                    size_t w = 0;
++                    for (size_t i = 0; i < checks.size(); ++i) {
++                        if (park_drops(static_cast<const ConvCheckpoint&>(checks[i]))) { moved.push_back(std::move(checks[i])); continue; }
++                        if (w != i) checks[w] = std::move(checks[i]);
++                        ++w;
++                    }
++                    checks.erase(checks.begin() + (std::ptrdiff_t) w, checks.end());
++                }
++                const size_t moved_gdn = moved.empty() ? 0 : moved.front().gdn.size();
++                const bool saved = strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, err,
++                        std::move(reuse), &reused_bytes, storage.empty() ? nullptr : &storage,
++                        moved.empty() ? nullptr : &moved);
++                for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
++                if (!saved) return false;
++                // the next checkpoint save would fault in fresh pages for what moved out: one is allocated now
++                if (moved_gdn > 0 && ckpt_pool.on() &&
++                    (!pool_refill.valid() || pool_refill.wait_for(std::chrono::seconds(0)) == std::future_status::ready))
++                    pool_refill = std::async(std::launch::async, [&ckpt_pool, moved_gdn] {
++                        ConvCheckpoint c;
++                        c.gdn.resize(moved_gdn);
++                        ckpt_pool.give(std::move(c));
++                    });
+                 if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                         std::move(reuse), &reused_bytes)) return false;
+                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
+@@ -13863,6 +13904,7 @@ int main(int argc, char** argv) {
+                 // the background copy of the last turn checkpoint (STRATA_CKPT_ASYNC) lands before anything below copies, frees
+                 // or writes the checkpoints (a join inside the session file writer would match only the copy of a checkpoint)
+                 strata::core::conversation_checkpoint_join(nullptr);
++                strata::core::conversation_park_join();   // (STRATA_PARK_ASYNC: the last park's K/V)
+                 if (path.empty()) { refuse("missing path"); continue; }
+                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
+                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
+@@ -14635,6 +14677,19 @@ int main(int argc, char** argv) {
+                                          : 0;
+             const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
+                                     (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
++            // STRATA_PARK_ASYNC: the checkpoints this request drops after its park - all of them when another state
++            // comes in (a parked conversation, a borrow, a batch slot) or the cvec changes, else the ones off this
++            // prompt's path (off_path below) - move into the parked image
++            struct ParkDrops {
++                std::function<bool(const ConvCheckpoint&)>& f;
++                ~ParkDrops() { f = nullptr; }
++            } park_drops_reset{park_drops};
++            if (park_async_env()) {
++                const bool drops_all = incoming.has_value() || borrow || slot_source >= 0 || want_cvec != cvec_cached;
++                park_drops = [&, drops_all](const ConvCheckpoint& c) {
++                    return drops_all || (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
++                };
++            }
+             if (borrow && !pin_sibling && park_worth) {
+                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
+                 const bool parked_ok = park_current(0);
+diff --git a/sycl/src/core/conversation_state.cpp b/sycl/src/core/conversation_state.cpp
+index f6bd041d..1911db77 100644
+--- a/sycl/src/core/conversation_state.cpp
++++ b/sycl/src/core/conversation_state.cpp
+@@ -258,7 +258,9 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
+ bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
+                                 const SessionState& ss, const ModelGeometry& g,
+                                 const QsaState* draft, std::string& error,
+-                                ConversationKvReuse reuse, size_t* reused_bytes) {
++                                ConversationKvReuse reuse, size_t* reused_bytes,
++                                std::vector<ConversationCheckpoint>* /*storage: STRATA_CKPT_POOL, CUDA only*/,
++                                std::vector<ConversationCheckpoint>* /*moved: STRATA_PARK_ASYNC, CUDA only*/) {
+     size_t estimate = 0;
+     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
+     // Build into a new object so a failure cannot publish a partial snapshot.
+-- 
+2.34.1
+
