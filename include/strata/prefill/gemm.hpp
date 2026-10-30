@@ -51,12 +51,23 @@ public:
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
+    /// --tp: the rest of the matrix lives on the PEER card (NativeDense::tp_peer_rows).  Rows [0, n_own) are read from
+    /// `W_blocks` and rows [n_own, N) from the peer's upload, BOTH dequantized into the scratch in row order, and the
+    /// single GEMM over the assembled matrix is the call the single card makes - so every output element, and the
+    /// reduction that produced it, is bit-identical to the single card's.  (The peer's blocks are read over P2P once
+    /// per chunk: a weight is read once for all T tokens, so the transfer is one matrix, not one per token.)
+    struct PeerRows {
+        const void* blocks = nullptr;   ///< the peer rank's native upload of its half
+        int64_t src_row0 = 0;           ///< its first row that belongs to the full matrix
+        int64_t n_own = 0;              ///< rows this card's own W_blocks supplies
+    };
+
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.  `ldx` (> K) is
     /// X's padded row stride, taken only by STRATA_PF_PAD's path (0 = K).
     /// On an MMQ build a beta = 0 product whose type is covered, whose K is a multiple of 256 values and whose matrix fits
     /// the card's shared memory runs through llama.cpp's int8 MMQ instead (opt-in: STRATA_DENSE_MMQ=1).
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
+                int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0, const PeerRows* peer = nullptr);
 
     /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
     /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in

@@ -26,6 +26,10 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/tp_allreduce.hpp"
+#include "strata/core/tp_gdn_state.hpp"
+#include "strata/core/tp_moe_split.hpp"
+#include "strata/kernels/verify_kernels.hpp"   // FetchSpans (the TP half-fetch's per-layer byte spans)
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -193,6 +197,69 @@ public:
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
 
+    // ================================ TENSOR PARALLELISM (two GPUs) ================================
+    /// --tp: this verifier is one half of a two-GPU tensor-parallel pair.  `rank` is 0 (the single-writer
+    /// allreduce device, CUDA0) or 1 (CUDA1); `peer_dev` is the other card's device index.  Both verifiers run
+    /// the SAME layers (the whole model), each with half the dense weights and half the GDN/QSA heads; the
+    /// per-layer dense partial sums are allreduced so both cards hold the full residual.  Set before `init`.
+    /// The rank-0 verifier is the coordinator: it owns both graphs and launches them concurrently in `run_tp`.
+    void set_tp(int rank, int peer_dev) { tp_rank_ = rank; tp_peer_dev_ = peer_dev; tp_on_ = true; }
+    /// The peer verifier of this TP pair (the other rank).  Set before `init` on the coordinator (rank 0).
+    void set_tp_peer(Verifier* peer) { tp_peer_ = peer; }
+    bool tp_on() const { return tp_on_; }
+    int tp_rank() const { return tp_rank_; }
+    int tp_peer_dev() const { return tp_peer_dev_; }
+    /// One TP window: the coordinator (rank 0) launches BOTH cards' graphs concurrently and waits for both.
+    /// `tokens`/`pos0`/`out` are the same as `run`; the pool is the coordinator's (rank 0's) pool.
+    bool run_tp(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                std::string& err);
+    /// The coordinator (rank 0) allocates the pair's shared handshake flags and installs the device pointers
+    /// on both ranks; opens P2P.  Called after both verifiers' `set_tp`/`set_tp_peer`.
+    bool tp_setup_flags(std::string& err);
+    /// Sizes and allocates THIS rank's half-width pipeline scratch and extracts its local 7168-channel GDN
+    /// conv weights.  Call on BOTH ranks after their `init` and `tp_setup_flags`.
+    bool tp_setup_scratch(std::string& err);
+    /// The rank-local persistent GDN state used by TP decode.  Prefill binds this exact view and advances it
+    /// in place; no second state allocation or post-prefill copy is allowed.
+    TpGdnStateView tp_gdn_state_view() const {
+        return {gdn_state_tp_, gdn_state_tp_floats_, g_ ? g_->n_gdn_layers() : 0, device_, tp_rank_};
+    }
+    /// Zeroes this rank's TP persistent state: the local GDN recurrent states and conv histories in the tp
+    /// arena, which the session's `session_zero` does not reach (the TP window graphs read the arena, not
+    /// `ss.gdn_state`).  Call on BOTH ranks at a fresh session, beside `session_zero` for each rank's session.
+    bool tp_zero_persistent(std::string& err);
+    /// The peer's `bo_` buffer as a P2P pointer on this rank's device (rank 0's allreduce reads and writes it).
+    /// The coordinator sets BOTH directions after the two verifiers have init'd.
+    void set_tp_bo_peer(float* peer_bo) { tp_bo_peer_ = peer_bo; }
+    /// The peer's full-width value buffer, resolved on THIS rank's device (P2P).  The column-parallel
+    /// out-projections each need the peer's half of the reduction vector, so BOTH ranks write into the other's
+    /// y_full_ (rank 1 -> rank 0's [ZVt, ZV) via broadcast_to_a, rank 0 -> rank 1's [0, ZVt) via broadcast).
+    void set_tp_y_peer(float* peer_y) { y_peer_ = peer_y; }
+    /// The peer's LOCAL-width gate/up hq (its `tp_moe_scratch_`'s hq region) resolved on THIS rank's device
+    /// over P2P; the MoE exchange reads it.  The coordinator sets BOTH directions after init (each rank reads
+    /// the other's local hq).
+    void set_tp_hq_peer(uint8_t* peer_hq, uint8_t* peer_hq2) {
+        tp_moe_hq_peer_ = peer_hq;
+        tp_moe_hq2_peer_ = peer_hq2;
+    }
+    /// This rank's LOCAL-width gate/up hq for group set `set` (0 or 1), for the peer's exchange to read (P2P).
+    /// `native_expert_hq_off(capx, n_ff_local)` bytes into the set's scratch.
+    uint8_t* tp_moe_local_hq(int set) const;
+    /// The peer's compact pitched band half (`tp_moe_hitc_`), resolved on THIS rank's device over P2P.  Rank 0
+    /// stitches it into its own full-width band before the combine so the chain's fp32 association matches the
+    /// single card's exactly.  Set by set_tp_hitc_peer; only rank 0 reads it.
+    void set_tp_hitc_peer(float* peer_hitc) { tp_moe_hitc_peer_ = peer_hitc; }
+    float* tp_moe_hitc() const { return tp_moe_hitc_; }
+    float* tp_y_full() const { return y_full_; }
+    float* tp_bo() const { return bo_; }
+    /// Rank 1 only: open the P2P pair in the mirrored order (dev_a = rank 0's card, dev_b = this card) and record
+    /// the local card.  The fused handshake runs on dev_b; the full-width GDN out-projection writes rank 0's
+    /// buffer over P2P (broadcast_to_a).  The shared flag words still belong to rank 0's tp_setup_flags.
+    bool tp_set_local_device(std::string& err) {
+        if (tp_rank_ == 0) return true;
+        return tp_ar_.open(tp_peer_dev_, device_, err);
+    }
+
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
 
@@ -292,6 +359,12 @@ public:
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
     bool capture_all(std::string& err);
+    /// Free the idle solo window graphs; the next window captures them again under whatever the kernels read THEN.
+    /// Returns how many executables were freed, 0 when there was nothing to free or the graphs are not ours to drop
+    /// (`--pipeline-windows` prepares them once).  A kernel switch that changes the summation ORDER (`select_simt`,
+    /// §8.3-3d) calls this so this request's prefill and its decode share one order.  Safe from any device: it enters
+    /// the verifier's own.
+    int drop_solo_graphs();
     bool pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
     /// Stage a window ahead of its launch (positions, and the PLE rows from `ple_prev` = the two tokens before the
     /// window as they WILL be, their pages prefetched).  A later `pl_launch` of the same window (T, pos0, tokens, and
@@ -357,14 +430,23 @@ public:
     bool pcie_balance_on() const { return bal_ != nullptr && m_bal_ != nullptr; }
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
+    /// STRATA_PCIE_TIMING=1: the ms this verifier spent copying missed experts over PCIe (pcie_mode 2's
+    /// fetch_blobs + rebase_ptrs, on the compute stream), summed over every window so far - the same running
+    /// total as ms_wait, so a request reads it as a delta. 0 when the timing is off.
+    double ms_pcie = 0;
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
     std::string profile_report();
+    /// The same line for the TP peer (rank 1): its own stamps, read back from its device after a sync. Rank 0's
+    /// report shows the time it spends waiting for the peer; only this one says what the peer was doing instead.
+    /// Empty when the peer is not profiling.
+    std::string peer_profile_report();
 
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool capture(int T, std::string& err);
+    bool sample_window(int T, const int32_t* tokens, int64_t pos0, std::string& err);
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
@@ -416,9 +498,24 @@ private:
     /// Free the graph pair of the least recently used batch layout other than `keep` (`evicted`: there was one).
     bool evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err);
     /// cudaGraphInstantiate; out of VRAM: batch layouts other than `key` (LRU), then (a batch graph) the solo window
-    /// graphs, then the relief hook, until it fits.  Fails only when none of them frees enough.
+    /// graphs, then (a single-request window, `keep_t` > 0) the graphs of the other window sizes, largest first
+    /// (#3702): a window size whose graph does not fit used to end the engine ("verify: instantiate: out of memory");
+    /// a freed size is captured again when it is next used.  Then the relief hook.  Fails only when none frees enough.
     bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key, const char* what,
-                              std::string& err);
+                              std::string& err, int keep_t = -1, unsigned long long flags = 0);
+    /// Free the graph of the largest window size other than `keep_t` (and the prelaunched one); `evicted`: there was one.
+    bool evict_window_graph(int keep_t, bool& evicted, std::string& err);
+    bool no_window_eviction_ = false;   ///< capture_all wants every size at once: it must not free one to capture another
+    void note_prio_fork(cudaStream_t from);   ///< STRATA_GRAPH_PRIO: where a branch leaves the main stream
+    void note_prio_tail(cudaStream_t on, int prio);   ///< STRATA_GRAPH_PRIO: a priority stream's tail at its join
+    void apply_node_priorities(cudaGraph_t graph, int T);   ///< STRATA_GRAPH_PRIO: repair + report the node priorities
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    // STRATA_GRAPH_PRIO (record_window / capture): the captured tails of the priority streams at their joins and the
+    // main stream's tails at their forks, so that a capture that dropped the stream priorities can be repaired per
+    // node (apply_node_priorities walks each tail back to its fork)
+    std::vector<cudaGraphNode_t> prio_forks_;
+    std::vector<std::pair<cudaGraphNode_t, int>> prio_tails_;
+#endif
     void collect_profile();   ///< STRATA_VERIFY_PROFILE: add the last window's stamps to prof_sum_
     void accumulate_profile(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
     // pipelined windows (pl_launch ...)
@@ -466,6 +563,23 @@ private:
     bool ar_on() const { return all_resident_ && !ar_off_; }
     void refresh_ar();
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
+    /// STRATA_TP_DUMP=1: the first 8 floats of every layer's `bo_` (the combined residual) in mapped host
+    /// memory, so a TP run and a single-card run of the same window can be compared layer by layer to find
+    /// the first one that diverges.  Null unless the variable is set.
+    float* h_tpdump_ = nullptr;   float* m_tpdump_ = nullptr;
+    /// STRATA_TP_VEC=N: the number of floats each dump site copies to `h_tpdump_ + kTpVecOff + site*N`, so a
+    /// whole vector can be diffed between the two paths (0: the scalar dumps only, the buffer is then sized as
+    /// it always was).  Read once at init; both paths use the same length, which is what makes the two dumps
+    /// comparable.
+    static int tp_vec_len();
+    static constexpr int kTpVecSites = 4;    ///< sites per layer: mixer input, pre-allreduce, post-combine, residual
+    static constexpr int64_t kTpVecOff = 4096;   ///< past every scalar slot of a solo-sized dump block (48*8+564 = 948)
+    /// The float offset of (layer, site)'s vector copy, or -1 when STRATA_TP_VEC is off.
+    int64_t tp_vec_at(int64_t l, int site) const {
+        const int n = tp_vec_len();
+        if (n <= 0 || h_tpdump_ == nullptr) return -1;
+        return kTpVecOff + (l * kTpVecSites + site) * (int64_t) n;
+    }
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
@@ -498,6 +612,11 @@ private:
     bool copy_used_ = false;
     bool capture_commit(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
+    // --tp: the tensor-parallel window.  The default decode path (all env-gated branches off) with the dense
+    // GDN/QSA projections split across the two cards and a per-layer allreduce of the out-proj partial.  Captured
+    // on this rank's device; the coordinator launches both ranks' graphs concurrently (run_tp).
+    bool record_window_tp(int T, cudaStream_t cs, std::string& err);
+    bool capture_tp(int T, std::string& err);
     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
     // per layer and token group, written to mapped memory (null when the trace is off)
     void trace_ev(const char* what, int64_t step, int64_t layer, int64_t aux) const;
@@ -576,6 +695,18 @@ private:
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
+    // STRATA_PCIE_TIMING: a device stamp before and after each fetch_blobs/rebase_ptrs pair (pcie_mode 2's H2D),
+    // summed at the window's sync into ms_pcie.  Device stamps, not cuda events: these calls run inside the
+    // captured window graph, and an event recorded in a graph cannot be read back (cudaEventElapsedTime says
+    // invalid argument).  gpu_stamp writes %globaltimer, which a graph node may do.  Off by default.
+    static constexpr int kPcieTimingMax = 256;                    // >= layers per stage x groups per layer
+    bool pcie_timed_ = false;
+    int pcie_n_ = 0;                                              // stamp slots used while recording this window
+    int pcie_pairs_ = 0;                                          // pairs in the recorded graph (every launch restamps)
+    bool pcie_drained_ = false;                                   // this window's stamps were summed already (done())
+    unsigned long long* pcie_st_ = nullptr;                       // device: 2 stamps per fetch (start, end), ns
+    std::vector<unsigned long long> pcie_h_;                      // the same, read back after the window's sync
+    void drain_pcie_timing();                                     // after the window finished: sum the pairs into ms_pcie
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
@@ -588,10 +719,152 @@ private:
     static void publish_plan(void* ctx);
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
+    // --tp: tensor parallelism across two GPUs.  tp_on_ is set by set_tp; tp_rank_ is 0 (CUDA0, the
+    // single-writer allreduce device and the coordinator) or 1 (CUDA1).  tp_peer_ is the other rank's
+    // verifier (set on the coordinator).  tp_ar_ is the P2P allreduce; tp_exec_[T] is this rank's window
+    // graph (captured on this rank's device).  The coordinator launches both ranks' graphs concurrently.
+    bool tp_on_ = false;
+    int tp_rank_ = 0;
+    int tp_peer_dev_ = -1;
+    Verifier* tp_peer_ = nullptr;
+    TpAllreduce tp_ar_;
+    cudaGraphExec_t tp_exec_[9] = {};
+    // TP per-layer handshake flags (mapped host memory, shared by both ranks; the device pointer is the same on
+    // both cards).  flag_b is raised by rank 1 after its out-proj partial; rank 0 waits on it before the allreduce.
+    // flag_a is raised by rank 0 after the allreduce; rank 1 waits on it before its next layer.  Values are the
+    // global layer index + 1 (0..n_layers), reset to 0 between runs.
+    uint32_t* tp_flag_a_h_ = nullptr;   uint32_t* tp_flag_a_d_ = nullptr;
+    uint32_t* tp_flag_b_h_ = nullptr;   uint32_t* tp_flag_b_d_ = nullptr;
+    /// flag_c: raised by rank 0 after the layer's MoE residual is the same on both cards.  With the experts'
+    /// FFN split (tp_moe_) it is raised after the combine's allreduce; rank 1 waits on it before the FFN half
+    /// read.  Kept for the pair's single-broadcast handshake.
+    uint32_t* tp_flag_c_h_ = nullptr;   uint32_t* tp_flag_c_d_ = nullptr;
+    /// flag_d / flag_e: the MoE combine's allreduce handshake.  Both cards compute their own half of every
+    /// routed expert (the intermediate width is cut in two), combine it into their own `bo_`, and the two
+    /// partials are summed:
+    ///   rank 1: combine -> raise(flag_d, l+1) -> wait(flag_e, l+1)
+    ///   rank 0: wait(flag_d, l+1) -> allreduce(bo_, peer bo_) -> raise(flag_e, l+1)
+    /// The allreduce is the single-writer form: rank 0's kernel writes BOTH cards' `bo_`.
+    uint32_t* tp_flag_d_h_ = nullptr;   uint32_t* tp_flag_d_d_ = nullptr;
+    uint32_t* tp_flag_e_h_ = nullptr;   uint32_t* tp_flag_e_d_ = nullptr;
+    /// flag_f: rank 0 has finished staging the layer's PCIe share (`fetch_blobs` + `rebase_ptrs`) and rank 1
+    /// may read the rebased pointers.  Rank 0 owns that staging area, so rank 1's read of it has to wait.
+    uint32_t* tp_flag_f_h_ = nullptr;   uint32_t* tp_flag_f_d_ = nullptr;
+    uint32_t* tp_flag_g_h_ = nullptr;   uint32_t* tp_flag_g_d_ = nullptr;   // GDN full-width out-projection
+    /// MoE hq exchange: flag_h is rank 1 -> rank 0 ("rank 1's gate/up1 local hq is written"), flag_i is
+    /// rank 0 -> rank 1 (the mirror).  Each rank raises its own AFTER its gate/up1 and waits the other's BEFORE
+    /// the exchange reads the peer's local hq over P2P - one flag per direction, as the GDN exchange.
+    uint32_t* tp_flag_h_h_ = nullptr;   uint32_t* tp_flag_h_d_ = nullptr;
+    uint32_t* tp_flag_i_h_ = nullptr;   uint32_t* tp_flag_i_d_ = nullptr;
+    /// MoE band stitch: flag_j is rank 1 -> rank 0 ("my pitched band half is written").  Rank 0 waits on it
+    /// before reading rank 1's half over P2P and stitching it into its own full-width band, so its combine input
+    /// matches the single card's byte for byte (see moe_hit_stitch).
+    uint32_t* tp_flag_j_h_ = nullptr;   uint32_t* tp_flag_j_d_ = nullptr;
+    /// The experts' FFN split, per rank: gate/up by the LOCAL intermediate width (n_ff/2), down by the LOCAL
+    /// OUTPUT width (n_embd/2) with the FULL n_ff reduction.  Set by tp_setup_scratch; `tp_moe_ok_` is false
+    /// when the pack's expert geometry cannot be split (the window then refuses rather than silently running
+    /// the whole MoE on one card).
+    TpMoeSplit tp_moe_;
+    bool tp_moe_ok_ = false;
+    /// Per layer, the byte spans of an expert blob THIS rank's kernels read (its gate/up rows, its down rows and
+    /// the NVFP4 tail), for the PCIe share's fetch: copying only those halves moves half the bytes over the link.
+    /// Offsets are into the packed blob and 16-byte aligned; `tp_half_fetch_` is false when any layer's pack makes
+    /// that impossible (the fetch then copies the whole blob, as before).  See fetch_blobs_spans.
+    std::vector<strata::kernels::FetchSpans> tp_fetch_spans_;
+    bool tp_half_fetch_ = false;
+    /// True when the TWO ranks' spans together TILE every layer's blob (no holes; overlaps - the NVFP4 tail both
+    /// ranks read - are harmless, every window copies source -> the same offsets).  Then a cache-ADMITTED blob's
+    /// slot can be filled by both ranks at once (fetch_blobs_spans dst2_mode 2) instead of one rank copying the
+    /// whole blob, which is what kept an admitted entry at a full-blob upload on one link.  Checked at startup,
+    /// because a hole in the slot is silent corruption for a later hit.
+    bool tp_slot_cover_ = false;
+    /// `STRATA_TP_TWO_RANK_SLOT=1` + tp_slot_cover_: fill an admitted slot from both ranks (dst2_mode 2) instead of
+    /// rank 0 copying the whole blob (mode 0) while rank 1 skips it (mode 1).  MEASURED SLOWER off by default: at 8K
+    /// the GPU-busy time per window went 104.52 -> 108.54 ms over both requests (and with FEWER misses, 7415 vs
+    /// 9415), because this rank's half reaches rank 0's slot as 16-byte peer stores over NVLink, which costs more
+    /// than the PCIe bytes it saves.  Left in for a future DMA-based fill (one cudaMemcpyPeerAsync per blob).
+    bool tp_two_rank_slot_ = false;
+    /// Rank 1's view of rank 0's staging area (tp_share_doorbell).  Rank 0 stages the PCIe share there when the HOST
+    /// does the DMA (pcie_mode 0/1); with pcie_mode 2 (`auto`) each rank stages its OWN half into its own `staging_`
+    /// over its own PCIe link, so the two links carry the fetch in parallel and NVLink keeps carrying the resident
+    /// experts' halves.  `staging_` on rank 1 stays this rank's own buffer.
+    uint8_t* tp_stage0_ = nullptr;
+    /// This rank's gate/up scratch at the LOCAL width (n_ff/2), ONE PER GROUP SET (a layer's two group sets -
+    /// the VRAM/doorbell share and the PCIe share - must not clobber the first's local hq before the exchange
+    /// reads it).
+    void* tp_moe_scratch_ = nullptr;
+    void* tp_moe_scratch2_ = nullptr;
+    /// The FULL-width hq (n_ff/32 blocks per entry) the down's `hq + e*(n_ff/32)` read expects; moe_hq_exchange
+    /// assembles the two ranks' halves into it over P2P.  One per group set.
+    void* tp_moe_hq_ = nullptr;
+    void* tp_moe_hq2_ = nullptr;
+    /// The split down's COMPACT [cap][n_embd/2] output (it writes `y[j*n_out+row]` with n_out halved);
+    /// moe_hit_pitch pitches each row into hit_out_'s own half.  ONE buffer for both group sets: their entries'
+    /// dst rows are disjoint (an entry is in exactly one tier), so the second down cannot clobber the first's.
+    float* tp_moe_hitc_ = nullptr;
+    /// DIAG (STRATA_MOE_HQ_DUMP=1): this rank's pinned staging for the capture-safe layer-0 hq dump.  The
+    /// in-graph D2H node (record_window_tp's dump_moe_hq_diag) fills the first moe_hq_diag_hq_bytes_ with the
+    /// ASSEMBLED set0 hq (cap x n_ff/32 blocks of 36B) and the rest with this rank's LOCAL set0 gate/up hq
+    /// (cap x (n_ff/2)/32 blocks of 36B).  run_tp writes the two ranks' buffers to disk after the window join.
+    uint8_t* h_moe_hq_diag_ = nullptr;
+    uint8_t* m_moe_hq_diag_ = nullptr;
+    int64_t moe_hq_diag_hq_bytes_ = 0;
+    int64_t moe_hq_dump_cap_ = -1;   // the prefill window's entry count (T*K), set when the D2H node fires at l==0
+    size_t moe_hq_dump_hq_sz_ = 0;   // bytes per .hq file (cap * (n_ff*2/32) * 36)
+    size_t moe_hq_dump_hitc_sz_ = 0; // bytes of this rank's down-output buffer (capx * n_embd/2 * 4)
+    bool moe_hq_dump_written_ = false;
+    /// The peer's LOCAL-width hq (its gate/up scratch's hq region), resolved on THIS rank's device over P2P;
+    /// moe_hq_exchange reads it.  One per group set.  Set by set_tp_hq_peer.
+    uint8_t* tp_moe_hq_peer_ = nullptr;
+    uint8_t* tp_moe_hq2_peer_ = nullptr;
+    /// Private copies of a layer plan's group-pointer arrays, shifted by this rank's offsets.  The plan block
+    /// is shared with the peer (tp_share_doorbell) and its `p_ptr2` is rewritten in place by rank 0's
+    /// `rebase_ptrs`, so the split's pointers are built beside it, never on top of it.  The GATE/UP call uses
+    /// these (the row offset is a group-pointer shift); the DOWN call uses the UNshifted plan pointers, its row
+    /// offset living in Ldown.down_off instead.
+    unsigned long long* tp_ptr_ = nullptr;    // capx entries, from the plan's `p_ptr` (gate/up)
+    unsigned long long* tp_ptr2_ = nullptr;   // capx entries, from the plan's rebased `p_ptr2` (gate/up)
+    // TP local GDN state: per GDN layer, the recurrent state over the LOCAL v-heads (HV/2) plus the LOCAL conv
+    // history (7168 channels).  Layout per layer: [S*(HV/2)*S] recurrent + [7168*3] conv, contiguous.
+    float* gdn_state_tp_ = nullptr;
+    int64_t gdn_state_tp_floats_ = 0;   // per-layer local GDN state size (floats)
+    // TP local scratch, one arena: the half-width GDN pipeline (qkv/h at 7168 conv channels, gate/beta at
+    // HV/2 heads, z/y at ZV/2) and the QSA out-projection's contiguous half of attn32_.  None of these may
+    // alias the full-width buffers: the row-parallel kernels want contiguous rows of the LOCAL width, while
+    // the full buffers are laid out at the global stride.
+    void* tp_arena_ = nullptr;
+    float* qkv_tp_ = nullptr;    // nG * MT * 7168
+    float* h_tp_ = nullptr;      // nG * MT * 7168
+    float* gate_tp_ = nullptr;   // nG * MT * (HV/2)
+    float* beta_tp_ = nullptr;   // nG * MT * (HV/2)
+    float* z_tp_ = nullptr;      // MT * (ZV/2)
+    float* y_tp_ = nullptr;      // MT * (ZV/2)
+    float* y_full_ = nullptr;    // MT * ZV: rank 0's full-width GDN value buffer (rank 1's half arrives over P2P)
+    float* y_peer_ = nullptr;    // rank 0's y_full_ resolved on rank 1's device (P2P), set by set_tp_y_peer
+    /// The column-parallel out-projections' scratch: the kernel writes a COMPACT [T][N/2] (its index is
+    /// `y[j * n_out + row]`), and each token is then pitched into bo_'s [T][N] layout.  MT * (N/2).
+    float* half_out_ = nullptr;
+    /// The TP commit graph: this rank's GDN conv history + recurrence state advance by the window's kept
+    /// tokens, plus the (replicated) QSA tail restore and indexer append.
+    bool capture_commit_tp(std::string& err);
+    cudaGraphExec_t tp_commit_exec_ = nullptr;
+    /// Both cards' commit graphs, launched together after a TP window.
+    bool tp_state_advance(int n_keep, std::string& err);
+    /// A TP pair runs ONE doorbell: rank 0's.  The MoE experts are replicated (both cards route identically),
+    /// so rank 1 reads rank 0's plan block and its flag/sequence words straight out of rank 0's mapped host
+    /// memory instead of asking the pool for a second copy.  `tp_share_doorbell` installs them on the peer
+    /// before the window's graphs are captured; the plan's staging pointers are reached over P2P.
+    void tp_share_doorbell(Verifier& peer);
+    // TP local GDN conv weights: per GDN layer, 7168 channels x 4 taps (F32), extracted from the full 10240-channel
+    // weight by tp_local_conv_weights.
+    float* conv_w_tp_ = nullptr;
+    // The peer's compact pitched band half, as a P2P pointer on this rank's device (rank 0's stitch reads it).
+    float* tp_moe_hitc_peer_ = nullptr;
+    // The peer's bo_ buffer, as a P2P pointer on this rank's device (rank 0's allreduce reads/writes it).
+    float* tp_bo_peer_ = nullptr;
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
     std::function<size_t(size_t)> vram_relief_;                   // set_vram_relief
     bool graph_oom_said_ = false;          ///< the escalation below said once
-    int drop_solo_graphs();                ///< free the idle solo window graphs (captured again on first use)
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 

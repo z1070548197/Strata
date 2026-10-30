@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "strata/core/tp_split_plan.hpp"
+
 namespace strata::core {
 class WeightTable;
 struct WeightRef;
@@ -22,8 +24,12 @@ public:
     NativeDense& operator=(const NativeDense&) = delete;
     /// With layer_hi >= 0, only the `blk.<l>.` matrices with layer_lo <= l < layer_hi are uploaded (a layer
     /// split's stage holds its own layers' projections, not the whole model's); the others keep data == nullptr.
+    /// With tp_rank >= 0 (tensor parallel), each dense Q8_0 projection is uploaded as this rank's half per the
+    /// split plan (tp_split_plan.hpp): column-parallel rows, row-parallel reduction, or the GDN q/k-replicated +
+    /// v-split layout.  The per-rank `native_data` is sized to the half; the GEMV in record_window_tp feeds the
+    /// matching per-rank n_in/n_out.  tp_rank < 0 (the default) uploads the full matrix (single-GPU / replicated).
     bool load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-              bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1);
+              bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1, int tp_rank = -1);
     /// Plan v0.3 P1: the canonical tensor names `load` would serve natively from these shards (eligible name,
     /// supported type, 2-D), read from the GGUF headers only - so the canonical arena can skip them.
     static bool served_names(const std::vector<std::string>& shards, bool include_ple_key,
@@ -44,6 +50,13 @@ public:
     /// loaded: `add_hc_skip` puts their rows in the arena's skip set, `load` quantizes them from the pack file).
     static bool hc_q8_requested();
     static bool add_hc_skip(const std::string& pack_dir, std::set<std::string>& skip);
+    /// --tp: the PEER rank's half of a split dense projection, for the card that runs the prompt path (a prompt chunk
+    /// is computed on one card, but the matrix lives half on each).  `name` is the canonical tensor name; `n_out` is
+    /// the FULL row count the caller is about to read, and a mismatch is refused rather than assembled (it would mean
+    /// the pack and the split plan disagree).  Returns false - `out` untouched - for a tensor that is not split (both
+    /// ranks hold the whole matrix) and for a Row-mode one, which cannot be assembled from the two halves by rows.
+    static bool tp_peer_rows(const WeightTable& peer, const std::string& name, int64_t n_out, TpPeerRows& out,
+                             std::string* why = nullptr);
     /// A projection's bf16 values for a path that has no Q8 kernel (the prompt path's GEMMs, the single-token read): the
     /// resident copy, or - when the row was skipped - the Q8_0 copy dequantized into a per-stream scratch (`slot` 0 / 1:
     /// two matrices alive at once).  nullptr if there is neither.

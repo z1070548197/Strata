@@ -150,6 +150,68 @@ __global__ void __launch_bounds__(64) gdn_ab_multi_kernel(const float* __restric
     gdn_ab_body<MAX_T, EXACT_T>(blockIdx.x, x, wa, wb, dt, ssm_a, gate, beta, n, h_v, T);
 }
 
+// TP variant: the local h_v v-heads are the GLOBAL heads [head_offset, head_offset + h_v).  The alpha/beta weights,
+// dt and ssm_a are indexed by the global head (r + head_offset); the gate/beta outputs are local (t * h_v + r).
+template <int MAX_T = kVerifyMaxT, bool EXACT_T = false>
+__device__ __forceinline__ void gdn_ab_body_tp(const int bx, const float* __restrict__ x, const uint16_t* __restrict__ wa,
+                                               const uint16_t* __restrict__ wb, const float* __restrict__ dt,
+                                               const float* __restrict__ ssm_a, float* __restrict__ gate,
+                                               float* __restrict__ beta, int n, int h_v, int T, int head_offset) {
+    const int row = bx * 2 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= 2 * h_v) return;
+    const bool is_beta = row >= h_v;
+    const int r = is_beta ? row - h_v : row;
+    const int gr = r + head_offset;   // the global v-head
+    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) gr * n);
+    float acc[MAX_T];
+#pragma unroll
+    for (int t = 0; t < MAX_T; ++t) acc[t] = 0.0f;
+    for (int j = lane; j < n / 8; j += 32) {
+        const uint4 wv = __ldg(w4 + j);
+        const float w0 = __uint_as_float(wv.x << 16), w1 = __uint_as_float(wv.x & 0xffff0000u);
+        const float w2 = __uint_as_float(wv.y << 16), w3 = __uint_as_float(wv.y & 0xffff0000u);
+        const float w4f = __uint_as_float(wv.z << 16), w5 = __uint_as_float(wv.z & 0xffff0000u);
+        const float w6 = __uint_as_float(wv.w << 16), w7 = __uint_as_float(wv.w & 0xffff0000u);
+#pragma unroll
+        for (int t = 0; t < MAX_T; ++t) {
+            if (!EXACT_T && t >= T) break;
+            const float* xt = x + (size_t) t * n;
+            const float4 xa = __ldg(reinterpret_cast<const float4*>(xt + j * 8));
+            const float4 xb = __ldg(reinterpret_cast<const float4*>(xt + j * 8 + 4));
+            float a = acc[t];
+            a = fmaf(w0, xa.x, a); a = fmaf(w1, xa.y, a);
+            a = fmaf(w2, xa.z, a); a = fmaf(w3, xa.w, a);
+            a = fmaf(w4f, xb.x, a); a = fmaf(w5, xb.y, a);
+            a = fmaf(w6, xb.z, a); a = fmaf(w7, xb.w, a);
+            acc[t] = a;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < MAX_T; ++t) {
+        if (!EXACT_T && t >= T) break;
+        float a = acc[t];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (lane != 0) continue;
+        if (is_beta) {
+            beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
+        } else {
+            const float v = a + dt[gr];
+            const float sp = v > 20.0f ? v : log1pf(__expf(v));
+            gate[(size_t) t * h_v + r] = sp * ssm_a[gr];
+        }
+    }
+}
+
+template <int MAX_T = kVerifyMaxT, bool EXACT_T = false>
+__global__ void __launch_bounds__(64) gdn_ab_multi_tp_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
+                                                             const uint16_t* __restrict__ wb, const float* __restrict__ dt,
+                                                             const float* __restrict__ ssm_a, float* __restrict__ gate,
+                                                             float* __restrict__ beta, int n, int h_v, int T,
+                                                             int head_offset) {
+    gdn_ab_body_tp<MAX_T, EXACT_T>(blockIdx.x, x, wa, wb, dt, ssm_a, gate, beta, n, h_v, T, head_offset);
+}
+
 // 143-amdk (STRATA_FUSE_CONVAB): the conv + L2 norm and the a/b projections in ONE launch.  They read different inputs (the qkv
 // projection and the layer input) and write different outputs, so they only share a node: blocks [0, conv) run the conv body,
 // the following blocks (token row 0 only) the a/b body, each exactly as its own kernel.
@@ -363,6 +425,97 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
         }
         // every thread takes the shuffles, as the single-token kernel does: inside the `rg == 0` branch hipcc on
         // gfx1151 gave another rounding for 3% of the outputs (gdn_parity section 5 on Aurora)
+        for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
+        if (rg == 0 && (col & 31) == 0) wsum[col >> 5] = sq_part;
+        __syncthreads();
+        if (rg == 0) {
+            const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+            const float scale = rsqrtf(ss / (float) S + eps);
+            const float zz = z[(size_t) t * value_dim + head * S + col];
+            const float yv = oc * scale * gam * (1.0f / (1.0f + __expf(-zz)));
+            y[(size_t) t * value_dim + head * S + col] = yv;
+            if constexpr (Q) gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
+        }
+    }
+    if (!ALL_OUT && n_keep != nullptr && n > 0) {
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+    }
+}
+
+// TP (tensor parallel): the same recurrence, but each card runs only its h_v v-heads (h_v is the LOCAL count,
+// HV/2) and the q/k heads are replicated (full, on both cards).  `head_offset` is this rank's global v-head
+// offset (rank * HV/2), so the q/k head is (head + head_offset) % h_k.  The state, gate, beta, z and y are all
+// local (indexed by the local h_v and the local head), and the v read is at 2*qk + head*S (the local h holds
+// q(2048) + k(2048) + v_half(3072), so the local v-head `head` is at 2*qk + head*S).  Bitwise identical to
+// gdn_step_norm_multi_kernel restricted to this rank's v-heads.
+template <bool ALL_OUT, bool Q>
+__global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_tp_kernel(float* __restrict__ state,
+                                                                        const float* __restrict__ hbuf, int C,
+                                                                        const float* __restrict__ gate,
+                                                                        const float* __restrict__ beta,
+                                                                        const float* __restrict__ z,
+                                                                        const float* __restrict__ gamma, float eps,
+                                                                        float* __restrict__ y, int h_k, int h_v, int T,
+                                                                        const int32_t* __restrict__ n_keep, int t_out_begin,
+                                                                        GdnQ81* __restrict__ xq, int head_offset) {
+    __shared__ float sk[2][S], sq[2][S];
+    __shared__ float red_kv[RG][S], red_o[RG][S];
+    __shared__ float wsum[S / 32];
+    const int head = blockIdx.x;
+    const int col = threadIdx.x;
+    const int rg = threadIdx.y;
+    const int qh = (head + head_offset) % h_k;   // the q/k head (q/k replicated, full on both cards)
+    const int qk = S * h_k;             // q at [0, qk), k at [qk, 2qk), v at [2qk, ...)
+    const int value_dim = S * h_v;
+    const int n = ALL_OUT ? T : (n_keep ? *n_keep : T);
+    if (n > 0) {
+        if (rg == 0) sk[0][col] = hbuf[qk + qh * S + col];
+        else if (rg == 1 && (ALL_OUT || 0 >= t_out_begin)) sq[0][col] = hbuf[qh * S + col];
+    }
+    const float gam = (rg == 0) ? gamma[col] : 0.0f;
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t) h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = ALL_OUT ? __ldg(&base[r * row_stride]) : base[r * row_stride];
+    for (int t = 0; t < n; ++t) {
+        const int cur = t & 1, nxt = (t + 1) & 1;
+        const float* ht = hbuf + (size_t) t * C;
+        const bool need_out = ALL_OUT || (t >= t_out_begin);
+        __syncthreads();
+        if (t + 1 < n) {
+            const float* ht_next = ht + C;
+            const bool need_next = ALL_OUT || (t + 1 >= t_out_begin);
+            if (rg == 0) sk[nxt][col] = ht_next[qk + qh * S + col];
+            else if (rg == 1 && need_next) sq[nxt][col] = ht_next[qh * S + col];
+        }
+        const float g = __expf(gate[(size_t) t * h_v + head]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[cur][rg * RPG + r], kv);
+        red_kv[rg][col] = kv;
+        __syncthreads();
+        const float kv_col = red_kv[0][col] + red_kv[1][col] + red_kv[2][col] + red_kv[3][col];
+        const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+        if (!need_out) {
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) s[r] = fmaf(g, s[r], sk[cur][rg * RPG + r] * delta);
+            continue;
+        }
+        float o = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) {
+            s[r] = fmaf(g, s[r], sk[cur][rg * RPG + r] * delta);
+            o = fmaf(s[r], sq[cur][rg * RPG + r], o);
+        }
+        red_o[rg][col] = o;
+        __syncthreads();
+        float oc = 0.0f, sq_part = 0.0f;
+        if (rg == 0) {
+            oc = (red_o[0][col] + red_o[1][col] + red_o[2][col] + red_o[3][col]) * rsqrtf((float) S);
+            sq_part = oc * oc;
+        }
         for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
         if (rg == 0 && (col & 31) == 0) wsum[col >> 5] = sq_part;
         __syncthreads();
@@ -719,6 +872,86 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
     fetch_blobs_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16), dst2);
     check("fetch_blobs");
+}
+
+// --tp: only this rank's spans of each blob cross the link (see FetchSpans).  The same coalesced 16-byte loads and
+// the same 128 B line fix-up as fetch_blobs_kernel; one block walks (span, blob, chunk) triples, so a single
+// launch covers all of a group's spans (a launch per span would cost more than the copy saves at 4 spans a group).
+//
+// `dst2_mode` picks what an entry the cache ADMITS (dst2[k] != 0) does here:
+//   0 - copy the WHOLE blob into the slot (dst2[k]): correct when this rank stages for the pair (the fallback,
+//       and the host-DMA modes), because the peer reads that slot over NVLink in later layers.
+//   1 - skip it - the other rank filled the slot both cards read.
+//   2 - copy THIS rank's spans into the slot at the same offsets (dst2[k] + off[j]).  With --tp both ranks call
+//       this with their own (disjoint) windows, so the two x8 links each carry half of the admitted blob and the
+//       slot ends up complete - mode 0 made one link carry a whole one.  Requires the two ranks' windows to TILE
+//       the blob (verify checks that at startup: overlaps are harmless - every window copies source -> the same
+//       offsets - only holes would let a later hit read stale bytes).
+// The entries the cache does not admit go to this rank's staging, spans only.
+__global__ void fetch_blobs_spans_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+                                         uint8_t* __restrict__ dst, long long stride, FetchSpans sp,
+                                         const unsigned long long* __restrict__ dst2, int dst2_mode) {
+    const long long ce = (long long) blockDim.x * kFetchU;                     // uint4 per chunk
+    long long cpb[4], base[4], span_per = 0;
+    for (int j = 0; j < sp.nr; ++j) {
+        cpb[j] = (sp.len[j] / 16 + ce - 1) / ce;
+        base[j] = span_per;
+        span_per += cpb[j];
+    }
+    if (span_per <= 0) return;
+    const long long whole_per = (stride / 16 + ce - 1) / ce;
+    const long long per_entry = dst2 != nullptr && dst2_mode == 0 && whole_per > span_per ? whole_per : span_per;
+    const long long total = (long long) *n * per_entry;
+    for (long long c = blockIdx.x; c < total; c += gridDim.x) {
+        const long long k = c / per_entry;
+        const long long ci = c - k * per_entry;
+        const bool admitted = dst2 != nullptr && dst2[k] != 0;
+        if (admitted && dst2_mode == 1) continue;
+        uint4 v[kFetchU];
+        if (admitted && dst2_mode == 0) {   // the whole blob, into the cache slot
+            const long long per = stride / 16;
+            if (ci >= whole_per) continue;
+            const uint4* s = (const uint4*) src[k];
+            uint4* d = (uint4*) dst2[k];
+            const int h = (int) ((8 - (((unsigned long long) s >> 4) & 7)) & 7);
+            if (ci == 0 && (long long) threadIdx.x < h && (long long) threadIdx.x < per) d[threadIdx.x] = s[threadIdx.x];
+            const long long o0 = ci * ce + h + threadIdx.x;
+#pragma unroll
+            for (int u = 0; u < kFetchU; ++u) { const long long o = o0 + (long long) u * blockDim.x; if (o < per) v[u] = s[o]; }
+#pragma unroll
+            for (int u = 0; u < kFetchU; ++u) { const long long o = o0 + (long long) u * blockDim.x; if (o < per) d[o] = v[u]; }
+            continue;
+        }
+        if (ci >= span_per) continue;
+        int j = 0;
+        while (j + 1 < sp.nr && ci >= base[j] + cpb[j]) ++j;
+        const long long per = sp.len[j] / 16;
+        const uint4* s = (const uint4*) (src[k] + (unsigned long long) sp.off[j]);
+        uint4* d = admitted ? (uint4*) (dst2[k] + (unsigned long long) sp.off[j])   // mode 2: this rank's half of the slot
+                            : (uint4*) (dst + (size_t) k * (size_t) stride + (size_t) sp.off[j]);
+        const int h = (int) ((8 - (((unsigned long long) s >> 4) & 7)) & 7);   // uint4 before the first 128 B line
+        const long long cc = ci - base[j];
+        if (cc == 0 && (long long) threadIdx.x < h && (long long) threadIdx.x < per) d[threadIdx.x] = s[threadIdx.x];
+        const long long o0 = cc * ce + h + threadIdx.x;
+#pragma unroll
+        for (int u = 0; u < kFetchU; ++u) { const long long o = o0 + (long long) u * blockDim.x; if (o < per) v[u] = s[o]; }
+#pragma unroll
+        for (int u = 0; u < kFetchU; ++u) { const long long o = o0 + (long long) u * blockDim.x; if (o < per) d[o] = v[u]; }
+    }
+}
+
+void fetch_blobs_spans(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes,
+                       const FetchSpans& spans, int cap, void* stream, const unsigned long long* dst2, int dst2_mode) {
+    if (cap <= 0 || spans.nr <= 0 || spans.nr > 4) return;
+    if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs_spans: blob size must be a multiple of 16\n"); std::exit(1); }
+    for (int j = 0; j < spans.nr; ++j)
+        if (spans.off[j] % 16 != 0 || spans.len[j] % 16 != 0 || spans.len[j] <= 0) {
+            std::fprintf(stderr, "fetch_blobs_spans: span %d must be 16-byte aligned and non-empty\n", j);
+            std::exit(1);
+        }
+    fetch_blobs_spans_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, dst, (long long) blob_bytes, spans, dst2,
+                                                                        dst2_mode);
+    check("fetch_blobs_spans");
 }
 
 void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream) {
@@ -1106,6 +1339,26 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     check("gdn_ab_multi");
 }
 
+void gdn_ab_multi_tp(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
+                     float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream, int head_offset) {
+    if (n_embd % 8 != 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
+        std::fprintf(stderr, "gdn_ab_multi_tp: invalid arguments\n");
+        std::exit(1);
+    }
+    const unsigned blocks = (unsigned) ((2 * h_v + 1) / 2);
+    cudaStream_t st = (cudaStream_t) stream;
+    switch (n_tok) {
+        case 1: gdn_ab_multi_tp_kernel<1, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, head_offset); break;
+        case 2: gdn_ab_multi_tp_kernel<2, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, head_offset); break;
+        case 3: gdn_ab_multi_tp_kernel<3, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, head_offset); break;
+        case 4: gdn_ab_multi_tp_kernel<4, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, head_offset); break;
+        case 5: gdn_ab_multi_tp_kernel<5, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, head_offset); break;
+        case 6: gdn_ab_multi_tp_kernel<6, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, head_offset); break;
+        default: gdn_ab_multi_tp_kernel<kVerifyMaxT, false><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, head_offset); break;
+    }
+    check("gdn_ab_multi_tp");
+}
+
 void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
                           void* stream) {
@@ -1187,6 +1440,36 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     check("gdn_step_norm_multi");
 }
 
+// TP: the recurrence over this rank's h_v v-heads (h_v = HV/2), q/k replicated (full), the q/k head mapped by
+// (head + head_offset) % h_k.  state/gate/beta/z/y are local (indexed by the local h_v and local head); h is the
+// local conv output (q(2048) + k(2048) + v_half(3072), C = 7168).  Bitwise identical to gdn_step_norm_multi
+// restricted to this rank's v-heads.
+void gdn_step_norm_multi_tp(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                            const int32_t* n_keep, void* stream, int t_out_begin, void* xq_out, int head_offset) {
+    GdnQ81* const xq = static_cast<GdnQ81*>(xq_out);
+    if (!state || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v <= 0 || n_tok < 1 ||
+        n_tok > kVerifyMaxT || head_offset < 0) {
+        std::fprintf(stderr, "gdn_step_norm_multi_tp: invalid arguments\n");
+        std::exit(1);
+    }
+    const dim3 g1((unsigned) h_v), b1(S, RG);
+    const bool all_out = n_keep == nullptr && t_out_begin <= 0;
+    if (xq && t_out_begin < n_tok) {
+        if (all_out) gdn_step_norm_multi_tp_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, xq, head_offset);
+        else gdn_step_norm_multi_tp_kernel<false, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, xq, head_offset);
+    } else if (all_out) {
+        gdn_step_norm_multi_tp_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, nullptr, head_offset);
+    } else {
+        gdn_step_norm_multi_tp_kernel<false, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, nullptr, head_offset);
+    }
+    check("gdn_step_norm_multi_tp");
+}
+
 namespace {
 __global__ void wait_flag_ge_kernel(const volatile uint32_t* flag, uint32_t value) {
     while (*flag < value) strata_spin_pause();
@@ -1252,6 +1535,14 @@ __global__ void wait_flag_ge_stamped_kernel(const volatile uint32_t* flag, uint3
     while (*flag < value) strata_spin_pause();
     __threadfence_system();
     if (t_out != nullptr) *t_out = strata_now_ns();
+}
+
+// TP handshake: raise a mapped-host flag to `value` (one thread).  The store is made visible to the peer device
+// (and the host) before the flag is raised, so a peer spinning on wait_flag_ge sees the preceding work's results.
+__global__ void raise_flag_kernel(volatile uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *flag = value;
+    __threadfence_system();
 }
 }  // namespace
 
@@ -1519,6 +1810,139 @@ void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long lo
                           void* stream) {
     wait_flag_ge_stamped_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, t_in, t_out);
     check("wait_flag_ge_stamped");
+}
+
+void tp_raise_flag(uint32_t* flag, uint32_t value, void* stream) {
+    raise_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check("tp_raise_flag");
+}
+
+// ---- the MoE tensor-parallel down's glue (see the header) ---------------------------------------------
+// The down is split by OUTPUT ROW (each card n_embd/2 rows, full n_ff reduction) so every element is bit-identical
+// with the single card.  That needs the FULL intermediate `hq` (n_ff/32 = 20 q8_1 blocks per entry at n_ff 640),
+// but each card's gate/up only produced its own half (10 blocks).  moe_hq_exchange assembles the two halves into
+// the contiguous image the down's `hq + e*(n_ff/32)` read expects; moe_hit_pitch pitches the compact [cap][n/2]
+// down output into the full [cap][n] buffer's own half.  A q8_1 block is 36 bytes = nine uint32.
+
+namespace {
+constexpr int kQ81BlockWords = 9;   // sizeof(block_q8_1) = 36 = 9 * 4
+
+// BYTE-GRANULAR, NOT WORD-GRANULAR.  The exchange used to move `uint32_t` words with a hardcoded 9 words per
+// block, which only works while every block is a whole number of words.  `block_q8_0` is 34 bytes, so that
+// division has no q8_0 form; counting in bytes instead serves both formats and costs nothing (the copy is
+// 34- or 36-byte runs either way, and a byte copy of a struct is the same memory traffic).
+__global__ void moe_hq_exchange_kernel(const uint8_t* __restrict__ local, const uint8_t* __restrict__ peer,
+                                       uint8_t* __restrict__ full, int half_bytes, int blk_bytes,
+                                       int own_off_blocks, int64_t cap) {
+    const int total_bytes = 2 * half_bytes;
+    const int half_blocks = half_bytes / blk_bytes;
+    const int64_t w = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= cap * total_bytes) return;
+    const int64_t e = w / total_bytes;
+    const int slot = (int) (w % total_bytes);
+    const bool own = slot < half_bytes;
+    const int sb = own ? slot : slot - half_bytes;                 // the source entry's byte (0..half_bytes)
+    const int dst_block = (own ? own_off_blocks : half_blocks - own_off_blocks) + sb / blk_bytes;
+    full[e * total_bytes + dst_block * blk_bytes + sb % blk_bytes] = (own ? local : peer)[e * half_bytes + sb];
+}
+
+__global__ void moe_hq_exchange_mmq_kernel(const uint8_t* __restrict__ local, const uint8_t* __restrict__ peer,
+                                           uint8_t* __restrict__ full, int64_t rows, int live_half_blocks,
+                                           int local_stride_blocks, int full_stride_blocks, int own_off_blocks,
+                                           int blk_bytes) {
+    // block_q8_1_mmq packs four 32-value groups as [4 metadata slots][128 q bytes], not as four
+    // adjacent q8_1 structs. Map each group's 4-byte metadata and 32-byte payload separately.
+    constexpr int sub_per_mmq = 4;
+    constexpr int meta_bytes = 4;
+    const int payload_bytes = blk_bytes - meta_bytes;
+    const int mmq_bytes = sub_per_mmq * blk_bytes;
+    const int64_t total = (int64_t) full_stride_blocks * rows * blk_bytes;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int byte = (int) (i % blk_bytes);
+    const int64_t logical_sub = i / blk_bytes;
+    const int64_t row = logical_sub % rows;
+    const int sub_in_row = (int) (logical_sub / rows);
+    const int peer_off = live_half_blocks - own_off_blocks;
+    const uint8_t* src = nullptr;
+    int src_sub = 0;
+    if (sub_in_row >= own_off_blocks && sub_in_row < own_off_blocks + live_half_blocks) {
+        src = local;
+        src_sub = sub_in_row - own_off_blocks;
+    } else if (sub_in_row >= peer_off && sub_in_row < peer_off + live_half_blocks) {
+        src = peer;
+        src_sub = sub_in_row - peer_off;
+    }
+    const int dst_mmq = sub_in_row / sub_per_mmq, dst_sub = sub_in_row % sub_per_mmq;
+    const int dst_in = byte < meta_bytes ? dst_sub * meta_bytes + byte
+                                         : sub_per_mmq * meta_bytes + dst_sub * payload_bytes + byte - meta_bytes;
+    const int64_t dst = ((int64_t) dst_mmq * rows + row) * mmq_bytes + dst_in;
+    if (src && src_sub < local_stride_blocks) {
+        const int src_mmq = src_sub / sub_per_mmq, src_in_sub = src_sub % sub_per_mmq;
+        const int src_in = byte < meta_bytes ? src_in_sub * meta_bytes + byte
+                                             : sub_per_mmq * meta_bytes + src_in_sub * payload_bytes + byte - meta_bytes;
+        const int64_t at = ((int64_t) src_mmq * rows + row) * mmq_bytes + src_in;
+        full[dst] = src[at];
+    } else {
+        full[dst] = 0;
+    }
+}
+
+__global__ void moe_hit_pitch_kernel(const float* __restrict__ half, float* __restrict__ out,
+                                     const int32_t* __restrict__ dst, int n, int n_half, int own_off) {
+    // The down writes slot e's row at `dst[e] * n_half` (the destination row, like every down kernel), so the
+    // compact source row to read for this slot is the SAME row - not the slot index.  `dst` is a permutation of
+    // [0, cap), so both this read and the write below stay inside the buffers.
+    const int64_t row = dst[blockIdx.x];
+    for (int j = threadIdx.x; j < n; j += blockDim.x)
+        out[row * n + j] = (j >= own_off && j < own_off + n_half) ? half[row * n_half + (j - own_off)] : 0.0f;
+}
+
+__global__ void moe_hit_stitch_kernel(const float* __restrict__ peer_half, float* __restrict__ out,
+                                      const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
+                                      int n, int n_half, int peer_off) {
+    // Only the rows the plan routed take part: `out` is the full [cap][n] band and `dst` is a permutation of
+    // [0, cap), so every row it names is written exactly once.  The peer's compact half is indexed by the SAME
+    // destination row, matching how the pitched write above placed it.
+    if (blockIdx.x >= (unsigned) *count) return;
+    const int64_t row = dst[blockIdx.x];
+    for (int j = threadIdx.x; j < n_half; j += blockDim.x)
+        out[row * n + peer_off + j] = peer_half[row * n_half + j];
+}
+}  // namespace
+
+void moe_hq_exchange(const uint8_t* local_hq, const uint8_t* peer_hq, uint8_t* full_hq, int64_t cap_entries,
+                     int half_blocks, int own_off_blocks, void* stream, int blk_bytes) {
+    const int half_bytes = half_blocks * blk_bytes;
+    const int64_t total = cap_entries * 2 * half_bytes;
+    const unsigned blocks = (unsigned) ((total + 255) / 256);
+    moe_hq_exchange_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(local_hq, peer_hq, full_hq, half_bytes,
+                                                                      blk_bytes, own_off_blocks, cap_entries);
+    check("moe_hq_exchange");
+}
+
+void moe_hq_exchange_mmq(const uint8_t* local_hq, const uint8_t* peer_hq, uint8_t* full_hq, int64_t rows,
+                          int live_half_blocks, int local_stride_blocks, int full_stride_blocks,
+                          int own_off_blocks, void* stream, int blk_bytes) {
+    const int64_t total = (int64_t) full_stride_blocks * rows * blk_bytes;
+    const unsigned blocks = (unsigned) ((total + 255) / 256);
+    moe_hq_exchange_mmq_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(
+        local_hq, peer_hq, full_hq, rows, live_half_blocks, local_stride_blocks,
+        full_stride_blocks, own_off_blocks, blk_bytes);
+    check("moe_hq_exchange_mmq");
+}
+
+void moe_hit_pitch(const float* half, float* out, const int32_t* dst, int64_t cap, int n, int n_half, int own_off,
+                   void* stream) {
+    moe_hit_pitch_kernel<<<(unsigned) cap, 256, 0, (cudaStream_t) stream>>>(half, out, dst, n, n_half, own_off);
+    check("moe_hit_pitch");
+}
+
+void moe_hit_stitch(const float* peer_half, float* out, const int32_t* dst, const int32_t* count, int cap, int n,
+                    int peer_off, void* stream) {
+    moe_hit_stitch_kernel<<<(unsigned) cap, 256, 0, (cudaStream_t) stream>>>(peer_half, out, dst, count, n,
+                                                                             n >> 1, peer_off);
+    check("moe_hit_stitch");
 }
 
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,

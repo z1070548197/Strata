@@ -950,6 +950,33 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     return c.used;
 }
 
+int qsa_kv_spans(const QsaState& st, const ModelGeometry& g, void** ptr, uint64_t* bytes) {
+    const QsaShapes s = qsa_shapes(g);
+    // the slot rows `qsa_state_init` takes for each array (its `rows`), so the two cannot drift
+    const uint64_t rows = (uint64_t) st.n_slots * s.n_head_kv * s.page_size;
+    const uint64_t code_row = (uint64_t) s.head_dim;                                        // int8 / uint8 code bytes
+    const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;  // FP16 scales, bytes
+    const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    int n = 0;
+    if (st.kv_hybrid) {
+        ptr[n] = st.k_q;     bytes[n++] = rows * code_row;
+        ptr[n] = st.k_scale; bytes[n++] = rows * scale_row;
+        ptr[n] = st.v_q4;    bytes[n++] = rows * q4_row;
+    } else if (st.kv_q4) {
+        ptr[n] = st.k_q4;    bytes[n++] = rows * q4_row;
+        ptr[n] = st.v_q4;    bytes[n++] = rows * q4_row;
+    } else if (st.kv_int8) {
+        ptr[n] = st.k_q;     bytes[n++] = rows * code_row;
+        ptr[n] = st.v_q;     bytes[n++] = rows * code_row;
+        ptr[n] = st.k_scale; bytes[n++] = rows * scale_row;
+        ptr[n] = st.v_scale; bytes[n++] = rows * scale_row;
+    } else {
+        ptr[n] = st.k_pool;  bytes[n++] = rows * code_row * 2;   // FP16 cells
+        ptr[n] = st.v_pool;  bytes[n++] = rows * code_row * 2;
+    }
+    return n;
+}
+
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;

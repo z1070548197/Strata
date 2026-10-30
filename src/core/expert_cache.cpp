@@ -635,6 +635,21 @@ void ExpertCache::layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) cons
     hi = (layer == n_layers_ - 1) ? slots_ : (layer + 1) * q;
 }
 
+void ExpertCache::clear_residency() {
+    if (residency_.empty()) return;
+    std::fill(residency_.begin(), residency_.end(), kNotResident);
+    next_free_ = 0;
+    admitted_ = 0;
+    // R4.2g: each layer's cursor back to the bottom of its own range - the same seeding open() does, and for the
+    // same reason it re-derives `lo` instead of taking 0.
+    for (size_t l = 0; l < layer_next_.size(); ++l) {
+        int64_t lo = 0, hi = 0;
+        layer_slot_range((int64_t) l, lo, hi);
+        layer_next_[l] = (int32_t) lo;
+    }
+    // `fills_` keeps counting: it is the start-to-now total the startup report prints, not a residency figure.
+}
+
 int32_t ExpertCache::slot_of(int64_t layer, int64_t expert) const {
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
     return residency_[(size_t) (layer * n_expert_ + expert)];

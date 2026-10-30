@@ -139,10 +139,12 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
 
 /// h[r, k] = silu(gate) * up of GU rows [2 n_ff wide]: interleaved (gate 2k, up 2k+1: the Strata pack) or split
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
-void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
+/// `ld_gu` / `ld_h` (0: 2 n_ff / n_ff): the row strides, for a caller whose rank window sits in a full-width row.
+void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream,
+            int64_t ld_gu = 0, int64_t ld_h = 0);
 /// swiglu of an NVFP4 group's gate/up rows (split halves) with scale_gu_rows' scales applied as they are read.
 void swiglu_scaled(const float* gu, float* h, int64_t rows, int64_t n_ff, const int32_t* bounds, int n,
-                   const float* tails, int64_t row0, void* stream);
+                   const float* tails, int64_t row0, void* stream, int64_t ld_gu = 0, int64_t ld_h = 0);
 /// sd[r] = the s_down of row r's expert (group-local bounds): the combine applies it as it reads the row.
 void down_row_scales(float* sd, const int32_t* bounds, int n, const float* tails, int64_t nrows, void* stream);
 /// swiglu_scaled (n_ff 640), then quantize() of its rows for a down product of `ggml_type`, then down_row_scales into

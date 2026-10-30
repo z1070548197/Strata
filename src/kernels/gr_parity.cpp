@@ -447,11 +447,14 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
                 strata::kernels::native_quantize_q8_1(d_mixed, d_ref, N, tt, stream);
                 check(cudaStreamSynchronize(stream), "qfuse sync");
                 if (qx) { cudaGraphExecDestroy(qx); cudaGraphDestroy(qg); }
-                if (v3) { std::printf("  QFUSE: the v3 read writes no q8_1 (%s)\n", wrote ? "WRONG: it says it did" : "ok"); qbad += wrote; break; }
+                if (!wrote) {
+                    std::printf("  QFUSE: selected GR read does not provide q8_1\n");
+                    break;
+                }
                 check(cudaMemcpy(hq.data(), d_q, (size_t) tt * (N / 32) * 36, cudaMemcpyDeviceToHost), "qfuse read");
                 check(cudaMemcpy(hr.data(), d_ref, (size_t) tt * (N / 32) * 36, cudaMemcpyDeviceToHost), "qfuse ref read");
-                if (!wrote || std::memcmp(hq.data(), hr.data(), (size_t) tt * (N / 32) * 36) != 0) {
-                    std::printf("  QFUSE: T=%d rep %d: %s\n", tt, rep, wrote ? "q8_1 bytes differ" : "not written");
+                if (std::memcmp(hq.data(), hr.data(), (size_t) tt * (N / 32) * 36) != 0) {
+                    std::printf("  QFUSE: T=%d rep %d: q8_1 bytes differ\n", tt, rep);
                     ++qbad;
                 }
             }

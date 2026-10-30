@@ -145,6 +145,91 @@ int main() {
                 }
             }
             std::printf("fetch_blobs into slots (dst2): %d cases\n", cases2);
+            // fetch_blobs_spans (the TP half-fetch): each rank copies only ITS byte windows of the blob into its
+            // own staging slot, so everything outside them must stay untouched; an admitted entry (dst2[k] != 0)
+            // goes WHOLE to its cache slot in mode 0 (the fallback: one rank stages for the pair), is SKIPPED in
+            // mode 1 (rank 1 in that fallback), and in mode 2 gets THIS rank's windows at the same offsets - the
+            // two ranks' windows tile the blob, so both links carry half of an admitted blob too.
+            int cases3 = 0;
+            for (int64_t bb : {(int64_t) 1456, (int64_t) 2764816, (int64_t) 3584016}) {
+                for (int n : {1, 5, 16}) {
+                    const int64_t q = (bb / 4) & ~(int64_t) 15;   // a quarter of the blob, 16 B aligned
+                    const int64_t off4[4] = {0, (bb / 2) & ~(int64_t) 15, (bb * 3 / 4) & ~(int64_t) 15, bb - 16};
+                    for (int nr : {1, 3, 4}) {
+                        strata::kernels::FetchSpans sp{};
+                        sp.nr = nr;
+                        for (int j = 0; j < nr; ++j) {
+                            sp.off[j] = off4[j];
+                            sp.len[j] = j == 3 ? 16 : q;
+                        }
+                        for (int mode = 0; mode < 3; ++mode) {
+                            std::vector<unsigned long long> ptr(cap, 0), dst2(cap, 0);
+                            std::vector<size_t> off(cap, 0);
+                            const size_t slot = ((size_t) bb + 128 + 4095) / 4096 * 4096;
+                            const size_t slots = host_bytes / slot;
+                            for (int k = 0; k < n; ++k) {
+                                off[(size_t) k] = (size_t) (rng() % slots) * slot + 16 * (size_t) (k % 8);
+                                ptr[(size_t) k] = (unsigned long long) (alias + off[(size_t) k]);
+                                if (k % 2 == 0)
+                                    dst2[(size_t) k] =
+                                        (unsigned long long) (d_slots + (size_t) (cap - 1 - k) * (size_t) bb);
+                            }
+                            ck(cudaMemcpy(d_ptr, ptr.data(), cap * sizeof(unsigned long long), cudaMemcpyHostToDevice), "ptr");
+                            ck(cudaMemcpy(d_dst2, dst2.data(), cap * sizeof(unsigned long long), cudaMemcpyHostToDevice), "dst2");
+                            ck(cudaMemcpy(d_n, &n, sizeof(int32_t), cudaMemcpyHostToDevice), "n");
+                            ck(cudaMemset(d_dst, kGuard, dst_bytes), "memset");
+                            ck(cudaMemset(d_slots, kGuard, dst_bytes), "memset slots");
+                            strata::kernels::fetch_blobs_spans(d_ptr, d_n, d_dst, bb, sp, cap, s, d_dst2, mode);
+                            strata::kernels::rebase_ptrs(d_ptr, d_n, d_dst, bb, s, d_dst2);
+                            ck(cudaStreamSynchronize(s), "fetch_blobs_spans");
+                            ck(cudaMemcpy(got.data(), d_dst, dst_bytes, cudaMemcpyDeviceToHost), "back");
+                            ck(cudaMemcpy(got2.data(), d_slots, dst_bytes, cudaMemcpyDeviceToHost), "back slots");
+                            std::vector<unsigned long long> rp(cap, 0);
+                            ck(cudaMemcpy(rp.data(), d_ptr, cap * sizeof(unsigned long long), cudaMemcpyDeviceToHost),
+                               "back ptr");
+                            bool ok = true;
+                            for (int k = 0; k < n && ok; ++k) {
+                                const bool admitted = dst2[(size_t) k] != 0;
+                                ok = rp[(size_t) k] == (admitted ? dst2[(size_t) k]
+                                                                 : (unsigned long long) (d_dst + (size_t) k * (size_t) bb));
+                                const uint8_t* stage = got.data() + (size_t) k * (size_t) bb;
+                                const uint8_t* cache = admitted ? got2.data() + (size_t) (cap - 1 - k) * (size_t) bb : nullptr;
+                                // the staging slot: an admitted entry of either mode is untouched; otherwise the
+                                // windows carry the source bytes and every other byte stays the guard
+                                auto in_window = [&](int64_t i) {
+                                    for (int j = 0; j < nr; ++j)
+                                        if (i >= sp.off[j] && i < sp.off[j] + sp.len[j]) return true;
+                                    return false;
+                                };
+                                for (int64_t i = 0; i < bb && ok; ++i) {
+                                    if (admitted) {
+                                        ok = stage[i] == kGuard;
+                                        continue;
+                                    }
+                                    ok = stage[i] == (in_window(i) ? host[off[(size_t) k] + (size_t) i] : kGuard);
+                                }
+                                // the cache slot: mode 0 the whole blob, mode 1 nothing, mode 2 this rank's windows
+                                for (int64_t i = 0; i < bb && ok && cache != nullptr; ++i) {
+                                    if (mode == 0) ok = cache[i] == host[off[(size_t) k] + (size_t) i];
+                                    else if (mode == 1) ok = cache[i] == kGuard;
+                                    else ok = cache[i] == (in_window(i) ? host[off[(size_t) k] + (size_t) i] : kGuard);
+                                }
+                                for (int j = 0; j < nr && ok && !admitted; ++j)   // the windows carry the source bytes
+                                    ok = std::memcmp(stage + sp.off[j], host + off[(size_t) k] + (size_t) sp.off[j],
+                                                     (size_t) sp.len[j]) == 0;
+                            }
+                            for (size_t i = (size_t) n * (size_t) bb; i < dst_bytes && ok; ++i) ok = got[i] == kGuard;
+                            if (!ok) {
+                                std::printf("fetch_blobs_spans: blob %lld B, %d blobs, %d spans, mode %d: wrong bytes\n",
+                                            (long long) bb, n, nr, mode);
+                                ++failures;
+                            }
+                            ++cases3;
+                        }
+                    }
+                }
+            }
+            std::printf("fetch_blobs_spans (TP half-fetch): %d cases\n", cases3);
             cudaFree(d_dst2);
             cudaFree(d_slots);
         }

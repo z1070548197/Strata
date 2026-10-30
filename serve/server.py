@@ -3958,6 +3958,9 @@ class Service:
                   if isinstance(req.get("response_format"), dict) else None,
                   "input": raw[:262144], "input_truncated": len(raw) > 262144,
                   "output": "", "reasoning": "", "output_truncated": False, "reasoning_truncated": False,
+                  # an agent's turn often answers with a tool call, which carries no text: keep those too, or every
+                  # such turn reads as an empty answer here (#1014)
+                  "tool_calls": [],
                   "queue_s": 0.0, "load_s": 0.0, "first_token_s": None,
                   "_clock": time.perf_counter()}
         with self.status_lock:
@@ -3974,7 +3977,8 @@ class Service:
                     return None
                 return {k: v for k, v in record.items() if not k.startswith("_")}
             return [{k: v for k, v in r.items()
-                     if k not in ("input", "output", "reasoning", "response") and not k.startswith("_")}
+                     if k not in ("input", "output", "reasoning", "response", "tool_calls")
+                     and not k.startswith("_")}
                     | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
                     for r in reversed(records)]
 
@@ -6231,26 +6235,47 @@ def make_handler(svc: Service):
             try:
                 for item in items:
                     if item is not None:
+                        tools = ()                     # the call pieces this item carries: (index, id, name, args)
                         if api == "openai":
                             delta = item["choices"][0]["delta"]
                             content, reasoning = delta.get("content", ""), delta.get("reasoning_content", "")
                             usage, timings = item.get("usage"), item.get("timings")
+                            tools = ((c.get("index", 0), c.get("id"), (c.get("function") or {}).get("name"),
+                                      (c.get("function") or {}).get("arguments"))
+                                     for c in delta.get("tool_calls") or ())
                         elif api == "responses":
                             kind = item["type"]
                             content = item["delta"] if kind == "response.output_text.delta" else ""
                             reasoning = item["delta"] if kind == "response.reasoning_text.delta" else ""
                             usage, timings = (item.get("response") or {}).get("usage"), None
                         else:
-                            _, event = item
+                            kind, event = item
                             delta = event.get("delta", {})
                             content, reasoning = delta.get("text", ""), delta.get("thinking", "")
                             usage, timings = event.get("usage"), None
+                            block = (event.get("content_block") or {}) if kind == "content_block_start" else {}
+                            if block.get("type") == "tool_use":    # its input follows as partial_json pieces
+                                tools = ((event.get("index", 0), block.get("id"), block.get("name"), None),)
+                            elif delta.get("partial_json"):
+                                tools = ((event.get("index", 0), None, None, delta["partial_json"]),)
                         with svc.status_lock:
-                            for name, value in (("output", content), ("reasoning", reasoning)):
+                            for field, value in (("output", content), ("reasoning", reasoning)):
                                 if value:
-                                    combined = self.record[name] + value
-                                    self.record[name] = combined[:262144]
-                                    self.record[name + "_truncated"] |= len(combined) > 262144
+                                    combined = self.record[field] + value
+                                    self.record[field] = combined[:262144]
+                                    self.record[field + "_truncated"] |= len(combined) > 262144
+                            for index, call_id, call_name, args in tools:
+                                calls = self.record.setdefault("tool_calls", [])
+                                call = next((c for c in calls if c["index"] == index), None)
+                                if call is None:       # #1014: the name arrives once, the arguments in pieces
+                                    if len(calls) >= 64:
+                                        continue
+                                    call = {"index": index, "id": "", "name": "", "input": ""}
+                                    calls.append(call)
+                                call["id"] = call_id or call["id"]
+                                call["name"] = call_name or call["name"]
+                                if args:
+                                    call["input"] = (call["input"] + args)[:262144]
                             if usage:
                                 self.record["usage"] = usage
                             if timings:
@@ -6570,6 +6595,20 @@ class Server(ThreadingHTTPServer):
         super().server_close()
 
 
+class DualStackServer(Server):
+    # 2026-10-19 (local): "host": "::" binds IPv6 with IPV6_V6ONLY off (Linux default), so the same socket
+    # also serves IPv4 via mapped addresses - 127.0.0.1:port keeps working while IPv6 clients (example.org)
+    # reach the service too.
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except OSError:
+            pass
+        super().server_bind()
+
+
 def warn_tight_ram(arena_mib) -> None:
     """The model's experts live in RAM (INFO arena_mib, engine 0.1.10+).  With less than ~6 GB left beside them for the
     system, the engine and this server, Linux ends the engine mid-answer when memory runs out (issue #27) and Windows
@@ -6815,7 +6854,7 @@ def origin_allowed(origin: str, host, names, origins=()) -> bool:
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.host_names = host_names_for(host, svc.allowed_hosts, svc.trusted_origins)
     svc.start_telemetry()
-    httpd = Server((host, port), make_handler(svc))
+    httpd = (DualStackServer if host == "::" else Server)((host, port), make_handler(svc))
     httpd.svc = svc
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
@@ -7220,7 +7259,7 @@ def main() -> int:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
-        Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
+        (DualStackServer if a.host == "::" else Server)((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError as e:
         ap.error(listen_problem(a.host, a.port, e))
     if cfg.get("tokenizer"):

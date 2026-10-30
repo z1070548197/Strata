@@ -371,6 +371,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/s2_gemv_fast.cu
                           src/kernels/cuda/router_top10.cu
                           src/kernels/cuda/quantize_act.cu
+                          src/kernels/cuda/nvfp4_q8_0_cpu_order.cu
                           src/kernels/cuda/rope.cu
                           src/kernels/cuda/rope_dynamic.cu
                           src/kernels/cuda/sampler.cu
@@ -566,7 +567,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/conversation_disk.cpp
-    src/core/rope_dynamic.cpp)
+    src/core/rope_dynamic.cpp src/core/tp_allreduce.cu src/core/tp_split.cu src/core/tp_split_plan.cpp
+    src/core/tp_moe_split.cpp src/core/kv_redistribute.cu src/core/gpu_busy.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -575,6 +577,66 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(host_graph_launch_test PRIVATE CUDA::cudart Threads::Threads)
     add_test(NAME host_graph_launch_test COMMAND host_graph_launch_test)
     set_tests_properties(host_graph_launch_test PROPERTIES TIMEOUT 30)
+
+    # The tensor-parallel suite (--tp): the primitives, the weight/state splits and the captured windows.
+    # Most need two CUDA devices with P2P; each test skips cleanly on a one-device box.
+    foreach(_tp_test tp_allreduce_test tp_split_test tp_weight_split_test tp_gdn_split_test
+                      tp_real_split_test tp_graph_test tp_moe_split_gpu_test tp_conv_split_test tp_gdn_e2e_test tp_outproj_split_test
+                      kv_redistribute_test)
+      if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/${_tp_test}.cu")
+        add_executable(${_tp_test} tests/core/${_tp_test}.cu)
+        target_include_directories(${_tp_test} PRIVATE include)
+        target_link_libraries(${_tp_test} PRIVATE strata_engine ${_strata_gpu_runtime_target})
+        add_test(NAME ${_tp_test} COMMAND ${_tp_test})
+        # tp_real_split_test and tp_gdn_e2e_test read real Q8_0 tensors through the relative path
+        # `tests/core/tp_data/...`, so they must run from the source root: add_test's default working
+        # directory is the build tree, where that path does not exist and both die with
+        # "FAIL: open - tests/core/tp_data/blk_0_attn_qkv_weight.q8_0".  That is a false failure -
+        # run by hand from the source root both pass - but it makes the whole TP suite look broken
+        # under `ctest -R tp_`.
+        set_tests_properties(${_tp_test} PROPERTIES TIMEOUT 300 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+      endif()
+    endforeach()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/tp_p2p_bench.cu")
+      add_executable(tp_p2p_bench tests/core/tp_p2p_bench.cu)
+      target_include_directories(tp_p2p_bench PRIVATE include)
+      target_link_libraries(tp_p2p_bench PRIVATE strata_engine ${_strata_gpu_runtime_target})
+    endif()
+    # tp_dense_assemble_test drives the prompt path's own GEMM (strata::prefill::Gemm, in strata_prefill), so it
+    # links one library more than the suite above.  It reads the same real Q8_0 fixtures.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/tp_dense_assemble_test.cu")
+      add_executable(tp_dense_assemble_test tests/core/tp_dense_assemble_test.cu)
+      target_include_directories(tp_dense_assemble_test PRIVATE include)
+      target_link_libraries(tp_dense_assemble_test PRIVATE strata_prefill strata_engine ${_strata_gpu_runtime_target})
+      add_test(NAME tp_dense_assemble_test COMMAND tp_dense_assemble_test)
+      set_tests_properties(tp_dense_assemble_test PROPERTIES TIMEOUT 300
+                           WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/tp_dense_concurrent_test.cu")
+      add_executable(tp_dense_concurrent_test tests/core/tp_dense_concurrent_test.cu)
+      target_include_directories(tp_dense_concurrent_test PRIVATE include)
+      target_link_libraries(tp_dense_concurrent_test PRIVATE strata_prefill strata_engine ${_strata_gpu_runtime_target}
+                                                              Threads::Threads)
+      add_test(NAME tp_dense_concurrent_test COMMAND tp_dense_concurrent_test)
+      set_tests_properties(tp_dense_concurrent_test PROPERTIES TIMEOUT 300)
+    endif()
+    foreach(_tp_real_gemm_test tp_gate_gemm_parity_test tp_qkv_gemm_parity_test)
+      if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/${_tp_real_gemm_test}.cu")
+        add_executable(${_tp_real_gemm_test} tests/core/${_tp_real_gemm_test}.cu)
+        target_include_directories(${_tp_real_gemm_test} PRIVATE include)
+        target_link_libraries(${_tp_real_gemm_test} PRIVATE strata_prefill strata_engine ${_strata_gpu_runtime_target})
+      endif()
+    endforeach()
+    foreach(_tp_prefill_test tp_gdn_chunked_prefill_test tp_gdn_chunked_recurrence_test tp_qsa_chunked_prefill_test
+                             tp_prefill_state_binding_test tp_prefill_coordinator_test tp_state_handoff_test)
+      if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/${_tp_prefill_test}.cu")
+        add_executable(${_tp_prefill_test} tests/core/${_tp_prefill_test}.cu)
+        target_include_directories(${_tp_prefill_test} PRIVATE include)
+        target_link_libraries(${_tp_prefill_test} PRIVATE strata_prefill strata_engine ${_strata_gpu_runtime_target})
+        add_test(NAME ${_tp_prefill_test} COMMAND ${_tp_prefill_test})
+        set_tests_properties(${_tp_prefill_test} PROPERTIES TIMEOUT 300)
+      endif()
+    endforeach()
   endif()
   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/exchange_storage_test.cpp")
     add_executable(exchange_storage_test tests/core/exchange_storage_test.cpp)
@@ -582,6 +644,30 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(exchange_storage_test PRIVATE Threads::Threads)
     add_test(NAME exchange_storage_test COMMAND exchange_storage_test)
     set_tests_properties(exchange_storage_test PROPERTIES TIMEOUT 60)
+  endif()
+
+  # tp_split_plan_test / tp_layout_test were written but never registered, so nothing ever built them and the
+  # split-plan contract they assert went unchecked.  Host-only (no GPU): register them here.
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/tp_split_plan_test.cpp")
+    add_executable(tp_split_plan_test tests/core/tp_split_plan_test.cpp src/core/tp_split_plan.cpp)
+    target_include_directories(tp_split_plan_test PRIVATE include)
+    add_test(NAME tp_split_plan_test COMMAND tp_split_plan_test)
+    set_tests_properties(tp_split_plan_test PROPERTIES TIMEOUT 60)
+  endif()
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/tp_layout_test.cpp")
+    add_executable(tp_layout_test tests/core/tp_layout_test.cpp src/core/tp_split_plan.cpp)
+    target_include_directories(tp_layout_test PRIVATE include)
+    add_test(NAME tp_layout_test COMMAND tp_layout_test)
+    set_tests_properties(tp_layout_test PROPERTIES TIMEOUT 60)
+  endif()
+  # tp_moe_split_test: the experts' FFN split's byte arithmetic.  Host-only (no GPU); the layout/row helpers
+  # come from strata_kernels (via strata_engine).  Same "written but never registered" gap as tp_layout_test.
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/tp_moe_split_test.cpp")
+    add_executable(tp_moe_split_test tests/core/tp_moe_split_test.cpp src/core/tp_moe_split.cpp)
+    target_include_directories(tp_moe_split_test PRIVATE include)
+    target_link_libraries(tp_moe_split_test PRIVATE strata_engine)
+    add_test(NAME tp_moe_split_test COMMAND tp_moe_split_test)
+    set_tests_properties(tp_moe_split_test PROPERTIES TIMEOUT 60)
   endif()
 
   # available_host_bytes(): MemAvailable, cgroup limits and the operator's --memory-limit-mib cap on fixture directories
@@ -656,6 +742,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(expert_cache_segmented_test PRIVATE strata_engine)
     add_test(NAME expert_cache_segmented_test COMMAND expert_cache_segmented_test)
     set_tests_properties(expert_cache_segmented_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    # TP_RESULTS §8.4: the phase switch - clear_residency empties the table, keeps the arena, and re-admits to the
+    # same slots (which needs each layer's cursor back at its own range's bottom, not at 0)
+    add_executable(expert_cache_clear_test tests/core/expert_cache_clear_test.cpp)
+    target_link_libraries(expert_cache_clear_test PRIVATE strata_engine)
+    add_test(NAME expert_cache_clear_test COMMAND expert_cache_clear_test)
+    set_tests_properties(expert_cache_clear_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     # STRATA_MMQ_DIRECT: slot_guard / slot_room / slot_tail on the uniform and the sized cache, and the default
     # (no guard) sized layout unchanged
     add_executable(expert_cache_slot_guard_test tests/core/expert_cache_slot_guard_test.cpp)
@@ -689,7 +781,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
-  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
+  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp
+                                    src/prefill/tp_coordinator.cpp)
   if(STRATA_ENABLE_HIP)
     # #313: the RDNA3 WMMA GEMMs include hip_runtime.h: AMD builds only (a CUDA build never sees this file)
     target_sources(strata_prefill PRIVATE src/prefill/wmma_gemm.cu)
@@ -1007,6 +1100,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(prefill_combine_write_test PRIVATE strata_prefill )
     add_test(NAME prefill_combine_write_test COMMAND prefill_combine_write_test)
     set_tests_properties(prefill_combine_write_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    # one TP rank's column block of the MoE combine (moe_combine_cols) against the full-width moe_combine, bit for
+    # bit: the stitched blocks must be the one-call result (GPU, synthetic, no model)
+    add_executable(moe_combine_cols_test tests/cuda/moe_combine_cols_test.cpp)
+    target_link_libraries(moe_combine_cols_test PRIVATE strata_prefill )
+    add_test(NAME moe_combine_cols_test COMMAND moe_combine_cols_test)
+    set_tests_properties(moe_combine_cols_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   endif()
   # native_expert_grouped's group stride and fused SwiGLU + q8_1, bitwise vs the launches before them (GPU, synthetic,
   # no model; --bench adds v1/new timings of a window's 48 calls in a graph)
@@ -1276,6 +1375,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(platform_memory_test PRIVATE strata_core ${_strata_gpu_runtime_target})
   add_test(NAME platform_memory_test COMMAND platform_memory_test)
 
+  # #3350 / #3470: the conversation copy streams and events are pooled across short-lived threads (needs a device, else skips)
+  add_executable(conversation_copy_streams_test src/core/conversation_copy_streams_test.cpp)
+  target_include_directories(conversation_copy_streams_test PRIVATE include)
+  target_link_libraries(conversation_copy_streams_test PRIVATE strata_core ${_strata_gpu_runtime_target})
+  add_test(NAME conversation_copy_streams_test COMMAND conversation_copy_streams_test)
+  set_tests_properties(conversation_copy_streams_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
     target_link_libraries(pinned_shared_test PRIVATE strata_core ${_strata_gpu_runtime_target})
@@ -1363,10 +1469,18 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(split_ring_test src/program/split_ring_test.cpp)
   target_include_directories(split_ring_test PRIVATE include)
   add_test(NAME split_ring_test COMMAND split_ring_test)
+  # prompt cache-tail reuse: external writers drain before refill/relayout/publish (CPU lifecycle fixture)
+  add_executable(prompt_loan_test src/program/prompt_loan_test.cpp)
+  target_include_directories(prompt_loan_test PRIVATE include)
+  add_test(NAME prompt_loan_test COMMAND prompt_loan_test)
   # the serve loop's conversation-cache retention policy (header-only, no library to link)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
+  # which window-size graph is freed when the next one does not fit (#3702; header-only, CPU)
+  add_executable(window_evict_test src/core/window_evict_test.cpp)
+  target_include_directories(window_evict_test PRIVATE include)
+  add_test(NAME window_evict_test COMMAND window_evict_test)
   # which path computes the draft layer's prompt K/V, and STRATA_SPLIT_MTP_BATCH's parsing (header-only, CPU)
   add_executable(draft_kv_plan_test src/program/draft_kv_plan_test.cpp)
   target_include_directories(draft_kv_plan_test PRIVATE include)
@@ -1860,7 +1974,29 @@ if(STRATA_NATIVE_EXPERTS)
   target_link_libraries(nvfp4_avx512_parity PRIVATE strata_kernels_cpu)
   add_test(NAME nvfp4_cpu_parity COMMAND nvfp4_avx512_parity)   # random blocks; the AVX2 rows bit-equal to ggml's
   set_tests_properties(nvfp4_cpu_parity PROPERTIES TIMEOUT 120)
-  if(STRATA_ENABLE_CUDA)   # the NVFP4 decode kernels vs ggml's reference
+  if(STRATA_ENABLE_CUDA)   # the GPU NVFP4 expert rows vs the CPU pool's kernels, bit for bit
+    # Not in the --use_fast_math list above: `/` stays IEEE and the SiLU uses include/strata/kernels/expf_exact.h.
+    add_executable(nvfp4_q8_0_cpu_parity tests/cuda/nvfp4_q8_0_cpu_parity.cpp)
+    target_link_libraries(nvfp4_q8_0_cpu_parity PRIVATE strata_kernels strata_kernels_cpu ggml-base CUDA::cudart)
+    add_test(NAME nvfp4_q8_0_cpu_parity COMMAND nvfp4_q8_0_cpu_parity)
+    set_tests_properties(nvfp4_q8_0_cpu_parity PROPERTIES TIMEOUT 600)
+    # the GROUPED native expert path (grp_ptr/grp_start/ent_tok) against the pool's per-expert kernels, bit for bit:
+    # this is what a resident expert on the GPU must produce so that residency cannot change the tokens
+    add_executable(nvfp4_q8_0_cpu_grouped_parity tests/cuda/nvfp4_q8_0_cpu_grouped_parity.cpp)
+    target_link_libraries(nvfp4_q8_0_cpu_grouped_parity PRIVATE strata_kernels strata_kernels_cpu ggml-base CUDA::cudart)
+    add_test(NAME nvfp4_q8_0_cpu_grouped_parity COMMAND nvfp4_q8_0_cpu_grouped_parity)
+    set_tests_properties(nvfp4_q8_0_cpu_grouped_parity PROPERTIES TIMEOUT 600)
+    # the ENTRY POINT above those kernels: `native_expert_grouped_q8_0` carves the scratch, runs the phases and
+    # quantizes the intermediate the way the engine will.  Covers phase1+2 == phase0 and both == the pool.
+    add_executable(nvfp4_q8_0_entry_parity tests/cuda/nvfp4_q8_0_entry_parity.cpp)
+    target_link_libraries(nvfp4_q8_0_entry_parity PRIVATE strata_kernels strata_kernels_cpu ggml-base CUDA::cudart)
+    add_test(NAME nvfp4_q8_0_entry_parity COMMAND nvfp4_q8_0_entry_parity)
+    set_tests_properties(nvfp4_q8_0_entry_parity PROPERTIES TIMEOUT 600)
+    # SPEED of that same path against native_expert_grouped.  Not a test (asserts nothing) - it is here so the
+    # ratio is reproducible instead of living in someone's scratch directory.
+    add_executable(nvfp4_q8_0_grouped_bench tests/cuda/nvfp4_q8_0_grouped_bench.cpp)
+    target_link_libraries(nvfp4_q8_0_grouped_bench PRIVATE strata_kernels strata_kernels_cpu ggml-base CUDA::cudart)
+    # the NVFP4 decode kernels vs ggml's reference
     add_executable(nvfp4_expert_gpu_parity src/kernels/nvfp4_expert_gpu_parity.cpp)
     target_link_libraries(nvfp4_expert_gpu_parity PRIVATE strata_kernels ggml-base CUDA::cudart)
     # the decode experts' weight bandwidth on random blobs of a format pair, and an output hash (bit-for-bit checks)

@@ -35,6 +35,10 @@ void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv
                        int h_v, void* stream);
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream);
+/// TP: gdn_ab_multi over this rank's h_v v-heads (h_v = HV/2), the global heads [head_offset, head_offset + h_v).
+/// The alpha/beta weights, dt and ssm_a are indexed by the global head; gate/beta are local (t * h_v + r).
+void gdn_ab_multi_tp(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
+                     float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream, int head_offset);
 /// The recurrence + output norm for T tokens (h = (T, conv_channels) as q|k|v, gate/beta (T, h_v), z/y
 /// (T, value_dim)).  With `n_keep == nullptr` the state is read and NOT written (verify); otherwise the first
 /// *n_keep tokens are run and the state is written (commit; `y` may be scratch).  Bitwise `fused_gdn_step_norm`.
@@ -55,6 +59,13 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);
+/// TP: the recurrence over this rank's h_v v-heads (h_v = HV/2), q/k replicated (full on both cards), the q/k head
+/// mapped by (head + head_offset) % h_k.  state/gate/beta/z/y are local (indexed by the local h_v and local head);
+/// h is the local conv output (q(2048) + k(2048) + v_half(3072), conv_channels = 7168).  Bitwise identical to
+/// gdn_step_norm_multi restricted to this rank's v-heads.
+void gdn_step_norm_multi_tp(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                            const int32_t* n_keep, void* stream, int t_out_begin, void* xq_out, int head_offset);
 /// The commit of `n_layers` GDN layers in two launches (engine-latency): layer i's conv history is
 /// `state + i * state_stride + conv_off` and its qkv rows `qkv + i * qkv_stride`, as gdn_conv_commit; its recurrence
 /// state `state + i * state_stride` over the first *n_keep rows of `h + i * h_stride` / `gate|beta + i * gb_stride`, as
@@ -89,6 +100,11 @@ void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned 
 /// into *t_out (either may be null): the verify window's PCIe-share balance, at no extra launch.
 void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long long* t_in, unsigned long long* t_out,
                           void* stream);
+/// TP handshake: raise a mapped-host flag to `value` (one thread, a system fence before and after the store).  The
+/// peer device spins on wait_flag_ge(flag, value) until it sees the preceding work's results.  Captured inside the
+/// graph like the other flag kernels.  (Named tp_raise_flag to avoid clashing with Verifier::raise_flag, the host-side
+/// flag setter.)
+void tp_raise_flag(uint32_t* flag, uint32_t value, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).  Inside a PDL
 /// stretch (pdl.hpp) the stamp passes the early launch on, so a profiled window keeps the chain it measures.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
@@ -132,6 +148,26 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
 /// memory, optional): blob k goes to dst2[k] instead where that is not 0 (STRATA_ADAPT_FETCH: a VRAM cache slot).
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream,
                  const unsigned long long* dst2 = nullptr);
+/// The same fetch for `--tp`, where each rank's expert kernels read only ITS half of every blob: copy, per blob,
+/// only the `nr` byte spans (`off[j]`/`len[j]`, both 16-byte aligned) that this rank reads, into the SAME offsets
+/// of the destination - the destination stride stays `blob_bytes`, so the plan's pointers, `rebase_ptrs` and the
+/// expert kernels are unchanged.  The bytes outside the spans are never read by this rank (see tp_moe_split.hpp:
+/// gate/up rows of its half, its down rows, and the NVFP4 tail), so HALF the PCIe traffic moves.  `nr` <= 4.
+///
+/// Both TP ranks call this with their own spans and their own staging, so both cards' PCIe links carry the fetch
+/// in parallel.  `dst2_mode` decides what a cache-ADMITTED entry (dst2[k] != 0: STRATA_ADAPT_FETCH also puts the
+/// blob into a VRAM cache slot on rank 0 that BOTH ranks read later) does here: 0 copies the WHOLE blob into the
+/// slot (the fallback, where one rank stages for the pair), 1 skips it, 2 copies THIS rank's spans into the slot
+/// at the same offsets - the two ranks' windows tile the blob, so each link carries half of an admitted blob too.
+/// Non-admitted entries always go to this rank's staging, spans only.
+struct FetchSpans {
+    int64_t off[4];
+    int64_t len[4];
+    int nr;
+};
+void fetch_blobs_spans(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes,
+                       const FetchSpans& spans, int cap, void* stream, const unsigned long long* dst2 = nullptr,
+                       int dst2_mode = 0);
 /// table[pairs[2k]] = pairs[2k + 1] for k < n, `pairs` in mapped host memory: a residency table's changed entries,
 /// stream-ordered before the window that reads it, without the copy engine (where the tier's swaps may queue).
 void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream);
@@ -184,6 +220,36 @@ bool multi_block_head_ops();
 /// True where the verify head's and the draft's greedy pick should be argmax_rows: sm_80 to sm_89 (the one-block
 /// kernel is slow there; sm_90+ has sample_tokens' cluster kernel, other cards keep sample_tokens).
 bool argmax_rows_wanted();
+/// The MoE tensor-parallel down's two glue kernels (see the .cu).  `moe_hq_exchange` assembles the full
+/// intermediate `hq` the output-row-split down needs: each entry's image is `2*half_blocks` activation blocks
+/// (20 at n_ff 640); this rank's own half (`local_hq`, this device) is placed at block offset `own_off_blocks`
+/// and the peer's half (`peer_hq`, the other card's device memory, read over P2P) at the complementary offset.
+/// The caller must order the peer's gate/up (which wrote `peer_hq`) before this launch with a handshake flag.
+/// `blk_bytes` is the activation block size: 36 for `block_q8_1` (the default), 34 for `block_q8_0`.  The copy is
+/// byte-granular, so either works - see the kernel's note on why it is not word-granular.
+void moe_hq_exchange(const uint8_t* local_hq, const uint8_t* peer_hq, uint8_t* full_hq, int64_t cap_entries,
+                     int half_blocks, int own_off_blocks, void* stream, int blk_bytes = 36);
+/// Prefill MMQ stores activation blocks block-major: block b contains every row, and rows are padded separately
+/// at the local and full widths. Copy both live halves into the full block-major image and zero its padding blocks.
+void moe_hq_exchange_mmq(const uint8_t* local_hq, const uint8_t* peer_hq, uint8_t* full_hq, int64_t rows,
+                         int live_half_blocks, int local_stride_blocks, int full_stride_blocks,
+                         int own_off_blocks, void* stream, int blk_bytes = 36);
+/// `moe_hit_pitch`: the split down writes each entry's row into a COMPACT [cap][n/2] buffer (`y[j*n_out+row]`
+/// with n_out halved); this pitches entry `dst[e]`'s n/2 floats into the full [cap][n] buffer's own half
+/// (offset `own_off`) and zeroes the peer's half, so the per-layer allreduce's `x + 0.0f` (bitwise `x`) adds
+/// the two disjoint halves exactly once.
+void moe_hit_pitch(const float* half, float* out, const int32_t* dst, int64_t cap, int n, int n_half,
+                   int own_off, void* stream);
+/// `moe_hit_stitch`: assemble the FULL-width MoE band on rank 0 from the two ranks' pitched halves.  The down
+/// is row-split, so each rank's `hit_out` carries real values in its own `n_half` columns and zeros in the
+/// peer's.  The single-card combine reduces ALL K experts in one chain before adding the shared expert, so
+/// `(cpu_chain + shared) + hit_chain` is NOT the same fp32 association as `all_chain + shared` - the split's
+/// allreduce of two per-rank chains differs by an ULP wherever the residency table puts experts on the CPU.
+/// Filling the peer's half here makes rank 0's combine input byte-identical to the single card's, so its
+/// output is too.  `dst`/`count` pick the rows that took part (the plan's hit rows); every copy is a plain
+/// float move, never a sum.
+void moe_hit_stitch(const float* peer_half, float* out, const int32_t* dst, const int32_t* count, int cap,
+                    int n, int peer_off, void* stream);
 /// Dense-attention step records for `n` cells: [cell, cell+1, (cell+1)/4, cell+1] from cells[i] (device memory).
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// A sliding attention window: for `n` step records (kStepCount ints each, n_kv at [1]) the selection becomes the

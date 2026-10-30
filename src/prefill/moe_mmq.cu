@@ -125,29 +125,31 @@ __global__ void strata_q2_kernel(const uint8_t* __restrict__ blob, uint16_t* __r
     for (int k = 0; k < 8; ++k) out[1 + k] = qh[k];
 }
 
+// ld_gu / ld_h: the row strides (0: 2 n_ff and n_ff).  The canonical split feeds a rank's 2 n_ff gate/up and n_ff H
+// windows out of a full-width row, so its strides are the full width.
 __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int64_t n_ff,
-                              bool interleaved) {
+                              bool interleaved, int64_t ld_gu, int64_t ld_h) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * n_ff) return;
     const int64_t r = i / n_ff, k = i % n_ff;
-    const float* row = gu + r * 2 * n_ff;
+    const float* row = gu + r * (ld_gu ? ld_gu : 2 * n_ff);
     const float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
-    h[i] = g / (1.0f + __expf(-g)) * u;
+    h[r * (ld_h ? ld_h : n_ff) + k] = g / (1.0f + __expf(-g)) * u;
 }
 
 // swiglu_kernel on the MMQ gate/up output with each expert's gate and up scales applied as it is read: the products
 // scale_gu_rows stored, without the pass that stored them
 __global__ void swiglu_scaled_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int64_t n_ff,
                                      const int32_t* __restrict__ bounds, int n, const float* __restrict__ tails,
-                                     int64_t row0) {
+                                     int64_t row0, int64_t ld_gu, int64_t ld_h) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * n_ff) return;
     const int64_t r = i / n_ff, k = i % n_ff, ra = row0 + r;
     int q = 0;
     while (q + 1 < n && ra >= bounds[q + 1]) ++q;
-    const float* row = gu + r * 2 * n_ff;
+    const float* row = gu + r * (ld_gu ? ld_gu : 2 * n_ff);
     const float g = row[k] * tails[4 * q], u = row[n_ff + k] * tails[4 * q + 1];
-    h[i] = g / (1.0f + __expf(-g)) * u;
+    h[r * (ld_h ? ld_h : n_ff) + k] = g / (1.0f + __expf(-g)) * u;
 }
 // swiglu_scaled_kernel, quantize_mmq_q8_1<D4>'s rows of its output and down_row_scales_kernel in one pass: a block per
 // row (128 threads, 4 values each, blockIdx.y the row's 512-value half), H never stored.  Each value is
@@ -457,6 +459,11 @@ void scale_down_rows(float* d, int64_t ld, const int32_t* bounds, int n, const f
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream,
               float* yscale, const int32_t* slot, int k_used) {
     if (rows <= 0) return;
+    // `cudaGetLastError` is STICKY: it reports the first failure since the last clear, not necessarily this launch's.
+    // Clearing here is what makes the error below attributable - without it a fault in an earlier step (the routing
+    // tables' copy, the expert staging) surfaces as "quantize: invalid argument" at a launch whose arguments are in
+    // fact valid, and the search goes the wrong way.
+    (void) cudaGetLastError();
     // a token's K rows are the same row of x: quantized once and scattered (the per-row gather did it K times)
     static const bool gather = [] { const char* e = std::getenv("STRATA_QUANT_GATHER"); return e != nullptr && std::atoi(e) != 0; }();
     const bool scatter = slot != nullptr && k_used > 0 && rows % k_used == 0 && !gather;
@@ -480,11 +487,29 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
     if (scatter) {
         quantize_scatter_mmq_q8_1_cuda(x, slot, xq, (ggml_type) t, cols, ld, pad512(cols), rows / k_used, rows, k_used,
                                        (cudaStream_t) stream);
+        if (std::getenv("STRATA_PREFILL_DBG") != nullptr) {
+            const cudaError_t e = cudaGetLastError();
+            int dev = -1;
+            cudaGetDevice(&dev);
+            std::fprintf(stderr,
+                         "mmq quantize dbg scatter: dev %d type %d cols %lld ld %lld rows %lld k_used %d padded %lld "
+                         "-> %s\n",
+                         dev, (int) t, (long long) cols, (long long) ld, (long long) rows, k_used,
+                         (long long) pad512(cols), cudaGetErrorString(e));
+        }
         ck(cudaGetLastError(), "quantize");
         return;
     }
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
                            (cudaStream_t) stream);
+    if (std::getenv("STRATA_PREFILL_DBG") != nullptr) {
+        const cudaError_t e = cudaGetLastError();
+        int dev = -1;
+        cudaGetDevice(&dev);
+        std::fprintf(stderr, "mmq quantize dbg plain: dev %d type %d cols %lld ld %lld rows %lld padded %lld -> %s\n",
+                     dev, (int) t, (long long) cols, (long long) ld, (long long) rows, (long long) pad512(cols),
+                     cudaGetErrorString(e));
+    }
     ck(cudaGetLastError(), "quantize");
 }
 
@@ -770,9 +795,10 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
 }
 
 void swiglu_scaled(const float* gu, float* h, int64_t rows, int64_t n_ff, const int32_t* bounds, int n,
-                   const float* tails, int64_t row0, void* stream) {
+                   const float* tails, int64_t row0, void* stream, int64_t ld_gu, int64_t ld_h) {
     if (rows <= 0) return;
-    swiglu_scaled_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, bounds, n, tails, row0);
+    swiglu_scaled_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, bounds, n, tails,
+                                                                                row0, ld_gu, ld_h);
     ck(cudaGetLastError(), "swiglu_scaled");
 }
 bool direct_ok(int t) {
@@ -814,9 +840,10 @@ void down_row_scales(float* sd, const int32_t* bounds, int n, const float* tails
     ck(cudaGetLastError(), "down_row_scales");
 }
 
-void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {
+void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream,
+            int64_t ld_gu, int64_t ld_h) {
     if (rows <= 0) return;
-    swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved);
+    swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved, ld_gu, ld_h);
     ck(cudaGetLastError(), "swiglu");
 }
 

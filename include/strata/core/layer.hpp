@@ -330,6 +330,14 @@ inline int qsa_kv_format(const QsaState& st) {
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+/// The K/V arrays a state actually holds, as (pointer, bytes) pairs, in the order `qsa_state_init` carves them:
+/// FP16 `{k_pool, v_pool}`, Q4_0 `{k_q4, v_q4}`, K8V4 `{k_q, k_scale, v_q4}`, INT8 `{k_q, v_q, k_scale,
+/// v_scale}`.  Returns how many pairs (2-4) were written.  The bytes cover the state's `n_slots` slots; the
+/// pools are `[page][kv_head][page_size][head_dim]`, so every slot is the same number of bytes and a byte
+/// prefix of them is exactly the cells `[0, slots)` - which is what a copier of a partially filled context
+/// needs.  It exists so a state copier does not re-derive the layout: `qsa_state_bytes`/`qsa_state_init` stay
+/// the authority for each array's size, and this reads the same arithmetic off an initialized state.
+int qsa_kv_spans(const QsaState& st, const ModelGeometry& g, void** ptr, uint64_t* bytes);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,

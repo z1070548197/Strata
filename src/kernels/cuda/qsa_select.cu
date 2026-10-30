@@ -1,5 +1,6 @@
 // src/kernels/cuda/qsa_select.cu - see include/strata/kernels/qsa_select.hpp.
 #include "strata/core/emulate.hpp"
+#include "strata/core/kernel_switches.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/geometry.hpp"
 #include <cstdlib>
@@ -1877,10 +1878,9 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
             // no TF32 tensor cores: the FP32 tiled kernel, opt-in (STRATA_SELECT_SIMT=1): its sum order differs from the
             // warp kernel's, so the default stays the caller's warp kernel and the output bytes stay the same
             // STRATA_SELECT_SIMT=2: block_scores_simt2_kernel (the same bits as =1, larger tiles)
-            static const int simt = [] {
-                const char* v = std::getenv("STRATA_SELECT_SIMT");
-                return v == nullptr ? 0 : v[0] == '1' ? 1 : v[0] == '2' ? 2 : 0;
-            }();
+            // §8.3 step 3d: the level is a RUNTIME value (seeded from the environment), so one process can read a
+            // short prompt with the warp kernel and a long one with the tiled one; one load per launch.
+            const int simt = strata::select_simt();
             if (!simt) return false;
             const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
             if (simt == 2) {

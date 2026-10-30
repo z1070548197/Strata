@@ -82,6 +82,13 @@ int SuffixDrafter::propose(int max_k, int32_t* out) {
     int k = 0;
     // The continuation may run into the current suffix (periodic text); reading history up to `cur` is valid.
     for (size_t q = best_end + 1; q <= cur && k < max_k; ++q) out[k++] = hist_[q];
+    // A match that covers two full periods is a repeat with period d, so the continuation is that period again:
+    // without this the newest occurrence caps the proposal at d tokens, and a window can never be wider than the
+    // period however long the text repeats (a loop, a table's rows, a pasted block). Verify rejects a wrong guess,
+    // so a false positive costs one window's rows, never an output token.
+    const int d = (int) (cur - best_end);
+    if (d > 0 && 2 * d <= best_len && k == d)
+        while (k < max_k) { out[k] = out[k - d]; ++k; }
     return k;
 }
 

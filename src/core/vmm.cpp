@@ -68,6 +68,13 @@ const Api& api() {
 
 }  // namespace
 
+namespace {
+int g_vmm_peer_dev = -1;
+}
+
+void vmm_set_peer_device(int dev) { g_vmm_peer_dev = dev; }
+int vmm_peer_device() { return g_vmm_peer_dev; }
+
 bool vmm_available() { return api().ok; }
 uint64_t vmm_granularity() { return api().ok ? api().gran : 0; }
 
@@ -135,19 +142,23 @@ bool VmmRange::set_access(int64_t lo, int64_t hi) {
     if (hi <= lo) return true;
     const Api& a = api();
     const int owner = dev_ >= 0 ? dev_ : a.dev;
-    CUmemAccessDesc d[2]{};
+    CUmemAccessDesc d[3]{};
     d[0].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     d[0].location.id = owner;   // the owning device reads and writes its chunks
     d[0].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     int n = 1;
-    if (owner != 0) {   // a P2P path lets device 0 touch a peer range directly; without one the
-        int ok01 = 0;   // driver refuses the extra location, so try it and fall back to owner-only
-        if (cudaDeviceCanAccessPeer(&ok01, 0, owner) == cudaSuccess && ok01) {
-            d[1].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            d[1].location.id = 0;
-            d[1].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            n = 2;
-        }
+    // The other devices that must reach it.  Two roles, and they can both apply:
+    //   * device 0, when `owner` is a peer - the peer-expert tier's P2P path reads a peer's range from CUDA0;
+    //   * vmm_peer_device(), the device a tensor-parallel pair's second rank runs on, which reads rank 0's
+    //     expert arena across P2P (see vmm_set_peer_device).
+    for (const int extra : {owner != 0 ? 0 : -1, vmm_peer_device()}) {
+        if (extra < 0 || extra == owner || n >= 3) continue;
+        int ok = 0;
+        if (cudaDeviceCanAccessPeer(&ok, extra, owner) != cudaSuccess || !ok) continue;
+        d[n].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        d[n].location.id = extra;
+        d[n].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        ++n;
     }
     const CUdeviceptr at = (CUdeviceptr) (base_ + (uint64_t) lo * a.gran);
     const size_t bytes = (size_t) ((uint64_t) (hi - lo) * a.gran);
@@ -188,6 +199,8 @@ void VmmRange::release() {}
 int64_t VmmRange::mapped_count() const { return 0; }
 bool VmmRange::map_one(int64_t, VmmChunk) { return false; }
 bool VmmRange::set_access(int64_t, int64_t) { return false; }
+void vmm_set_peer_device(int) {}
+int vmm_peer_device() { return -1; }
 bool VmmRange::commit_run(int64_t, int64_t) { return false; }
 VmmChunk VmmRange::unmap(int64_t) { return 0; }
 }  // namespace strata::core

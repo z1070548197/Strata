@@ -10,6 +10,8 @@
 // Requires the native weights (`--native`): every quantized projection must carry its GGUF blocks.
 #pragma once
 
+#include "strata/core/tp_gdn_state.hpp"
+
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
@@ -44,6 +46,25 @@ struct PrefillStats {
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; }
 namespace strata::prefill {
+
+class GdnYExchange {
+public:
+    virtual ~GdnYExchange() = default;
+    virtual bool stitch_y(int rank, int64_t chunk_pos, int64_t layer, int64_t T,
+                          const float* local_y, int64_t local_ld, float* full_y, int64_t full_ld,
+                          void* stream, std::string& err) = 0;
+    virtual bool stitch_output(int rank, int64_t chunk_pos, int64_t layer, int64_t T,
+                               const float* local_output, int64_t local_ld,
+                               float* full_output, int64_t full_ld,
+                               void* stream, std::string& err) = 0;
+    virtual bool exchange_hq(int rank, int64_t chunk_pos, int64_t layer,
+                             const void* local_hq, int64_t local_bytes,
+                             void* full_hq, int64_t full_bytes,
+                             void* stream, std::string& err) = 0;
+    virtual bool broadcast_residual(int rank, int64_t chunk_pos, int64_t layer,
+                                    float* residual, int64_t count,
+                                    void* stream, std::string& err) = 0;
+};
 
 class Prefill {
 public:
@@ -176,6 +197,13 @@ public:
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
+
+    /// Bind the exact rank-local GDN state consumed by TP decode.  Must be called before init; the view is
+    /// borrowed and advanced in place by TP prefill, never owned or copied by Prefill.
+    bool set_tp_gdn_state(const core::TpGdnStateView& view, std::string& err);
+    bool tp_gdn_state_bound() const;
+    int tp_rank() const;
+    void set_gdn_y_exchange(GdnYExchange* exchange);
 
     /// Plan v0.3 P6: called after every chunk with the chunk's final multi-stream residual rows (device,
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its

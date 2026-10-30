@@ -56,6 +56,12 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
+/// The hq region's byte offset inside a scratch buffer ALLOCATED at the width `width`: the `gate|up|h` triple
+/// each strides `cap*width` floats, so hq starts at `3 * align256(cap*width*4)`.  The MoE TP's gate/up call at
+/// the LOCAL width (n_ff/2) places its hq here, and the exchange assembles the full-width hq at the offset
+/// computed for the FULL width into the same buffer (the two regions do not overlap: the local one sits at
+/// 3/6 of the full one).
+size_t native_expert_hq_off(int64_t cap_entries, int64_t width);
 
 /// A770 port (STRATA_PF_XMX=2): up to kXmxGroupMax experts' products in one XMX launch, the weights decoded from the
 /// quantized rows into local memory.  Expert i: Y_i[cnt[i]][N] = X_i . W_i^T (X FP16, Y FP32, rows back to back).
@@ -79,6 +85,22 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries.  Bitwise the same results
 /// (native_grouped_parity checks it); kept for A/B timing.  Set before graph capture; captured graphs keep theirs.
 void native_grouped_set_v1(bool v1);
+
+/// THE CPU-POOL-ORDER VARIANT of `native_expert_grouped`: identical layout, scratch carving and two-phase protocol,
+/// but the activation is `block_q8_0` (34 bytes, the pool's own contract) and the arithmetic is
+/// `nvfp4_q8_0_grouped_{gu,down}` - a bit-exact transcription of the pool's `nvfp4_256_{gu_,}rows`, including
+/// glibc's SiLU expf.  Use it so a VRAM hit and a CPU miss return the same number: that is what lets the resident
+/// SET change without changing the generated tokens, which is the precondition for raising residency for speed.
+///
+/// `x_q8_0` holds rows of `act_stride` bytes from `quantize_q8_0` (or the CPU's ggml `from_float` - the parity test
+/// proves the two are byte-identical).  `scratch` is carved exactly as `native_expert_grouped` carves it
+/// (`native_expert_scratch_bytes`); phase 1 leaves the intermediate's Q8_0 image at `scratch + 3*fa`, where phase 2
+/// reads it.  NVFP4 only (gu_type and d_type must both be 40).
+void native_expert_grouped_q8_0(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                                const uint8_t* x_q8_0, int act_stride, void* scratch, float* out, void* stream,
+                                int phase, int64_t grid_groups = 0);
 
 /// The bench only: the AMD kernel layout (STRATA_EXP_MODE values; -1 = the environment's) and the phase
 /// (0 all, 1 gate/up + SwiGLU + quantize, 2 down).

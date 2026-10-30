@@ -6,6 +6,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/core/tp_split_plan.hpp"
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -249,7 +250,7 @@ NativeDense::~NativeDense() {
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
+                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi, int tp_rank) {
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -257,6 +258,45 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     };
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
+    // UPLOADING FROM AN MMAP AT PAGEABLE SPEED WAS THE STARTUP BOTTLENECK.  `gguf.tensor_data` points into an mmap;
+    // a `cudaMemcpy` from pageable memory makes the driver stage through its own internal buffer and synchronize per
+    // call, which measured 2948 MiB in 38.2 s (78 MB/s - an order of magnitude below this link's 6.7 GB/s).  These
+    // three helpers give the copy a page-locked source and a stream to run on, so the driver DMAs while the next
+    // tensor is copied into the other slot.
+    struct Uploader {
+        enum { kSlots = 3 };
+        uint8_t* pin[kSlots] = {nullptr, nullptr, nullptr};
+        size_t cap[kSlots] = {0, 0, 0};
+        cudaStream_t stream = nullptr;
+        int next = 0;
+        Uploader() { (void) cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking); }
+        ~Uploader() {
+            if (stream != nullptr) (void) cudaStreamSynchronize(stream);
+            for (int i = 0; i < kSlots; ++i) if (pin[i] != nullptr) cudaFreeHost(pin[i]);
+            if (stream != nullptr) (void) cudaStreamDestroy(stream);
+        }
+        cudaError_t run(void* dst, const void* src, size_t bytes) {
+            if (stream == nullptr) return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);   // no stream: as before
+            const int s = next; next = (next + 1) % kSlots;
+            if (cap[s] < bytes) {
+                if (pin[s] != nullptr) cudaFreeHost(pin[s]);
+                pin[s] = nullptr; cap[s] = 0;
+                if (cudaHostAlloc((void**) &pin[s], bytes, cudaHostAllocDefault) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    pin[s] = nullptr;
+                    return cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);   // fall back, never fail the load
+                }
+                cap[s] = bytes;
+            }
+            std::memcpy(pin[s], src, bytes);
+            // The slot is not reused until this copy retires, so wait on it before returning: kSlots deep would need
+            // per-slot events, and the measured win here is already the pinned source, not the overlap.
+            cudaError_t e = cudaMemcpyAsync(dst, pin[s], bytes, cudaMemcpyHostToDevice, stream);
+            if (e == cudaSuccess) e = cudaStreamSynchronize(stream);
+            return e;
+        }
+    } uploader;
+    auto upload_bytes = [&](void* dst, const void* src, size_t bytes) { return uploader.run(dst, src, bytes); };
     try {
         std::vector<Pending> pending;
         std::set<std::string> seen;
@@ -347,13 +387,32 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
                     err = "native dense: incompatible matrix " + tensor.name; return false;
                 }
-                const auto bytes = strata::kernels::native_mmvq_weight_bytes(
+                // TP: this rank's half of a dense Q8_0 projection (column-parallel rows, row-parallel
+                // reduction, or the GDN q/k-replicated + v-split layout).  tp_rank < 0 keeps the full matrix.
+                const TpSplit tp = (tp_rank >= 0 && tensor.type == 8) ? tp_split_for(tensor.name, tp_rank) : TpSplit{};
+                const bool tp_split = (tp_rank >= 0 && tensor.type == 8 && tp.mode != TpMode::Replicate);
+                const uint64_t full_bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
+                const uint64_t bytes = tp_split ? tp_q8_0_bytes(tensor.name, tp_rank) : full_bytes;
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
-                if (status == cudaSuccess)
-                    status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
+                if (status == cudaSuccess) {
+                    if (tp_split) {
+                        // Host-side split of the full GGUF tensor into this rank's half, then H2D.
+                        std::vector<uint8_t> host(full_bytes);
+                        std::memcpy(host.data(), gguf.tensor_data(tensor), full_bytes);
+                        std::vector<uint8_t> half(bytes);
+                        const size_t written = tp_split_q8_0_host(host.data(), tp.mode, (int) ref.ne0, (int) ref.ne1,
+                                                                  tp_rank, half.data());
+                        if (written != bytes) {
+                            err = "native dense TP split " + tensor.name + ": size mismatch"; return false;
+                        }
+                        status = upload_bytes(data.get(), half.data(), bytes);
+                    } else {
+                        status = upload_bytes(data.get(), gguf.tensor_data(tensor), bytes);
+                    }
+                }
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }
@@ -361,9 +420,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 total += bytes;
                 allocated += alloc_bytes(bytes);
                 // STRATA_Q8_PACKED=1: a second, packed copy of an eligible Q8_0 matrix for the decode MMVQ (the GGUF
-                // copy stays: the prompt path's GEMMs read it).
+                // copy stays: the prompt path's GEMMs read it).  Disabled under TP: the packed copy is full-size and
+                // the prompt path is single-GPU; record_window_tp reads the per-rank native_data directly.
                 DevicePtr packed;
-                if (tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" &&   // the PLE has its own kernel
+                if (!tp_split && tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" &&   // the PLE has its own kernel
                     strata::kernels::native_q8_0_packed_enabled() &&
                     strata::kernels::native_q8_0_packed_eligible((int) ref.ne0, (int) ref.ne1)) {
                     std::vector<uint8_t> host(bytes);
@@ -503,6 +563,19 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     }
 }
 bool NativeDense::hc_q8_requested() { return hc_q8_env(); }
+
+bool NativeDense::tp_peer_rows(const WeightTable& peer, const std::string& name, int64_t n_out, TpPeerRows& out,
+                               std::string* why) {
+    const auto refuse = [why](const char* r) { if (why != nullptr) *why = r; return false; };
+    const WeightRef* w = peer.find(name);
+    if (w == nullptr || w->native_data == nullptr) return refuse("the peer holds no native upload of it");
+    TpPeerRows r;
+    // The row mapping itself is the split plan's (tp_peer_rows_for), so it is testable without a weight table.
+    if (!tp_peer_rows_for(name, n_out, r, why)) return false;
+    r.blocks = w->native_data;
+    out = r;
+    return true;
+}
 
 bool NativeDense::add_hc_skip(const std::string& pack_dir, std::set<std::string>& skip) {
     std::FILE* f = std::fopen((pack_dir + "/index.txt").c_str(), "rb");

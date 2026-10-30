@@ -157,6 +157,17 @@ public:
     /// sweep) and a placeholder policy would set the hit rate that everything downstream is then sized against.
     int32_t admit(int64_t layer, int64_t expert);
 
+    /// **THE PHASE SWITCH: FORGET WHICH (layer, expert) LIVES WHERE, KEEPING THE SLOTS AND THEIR SIZES.**
+    ///
+    /// A slot holds a FULL expert blob and the TP MoE paths address their half by a pointer offset, so one cache
+    /// can serve a layer-split phase (only that stage's layers) and a TP phase (all of them) with no layout
+    /// change; the only thing that differs is the admitted set.  `admit` never evicts, so a phase change needs
+    /// this: afterwards every `slot_of` answers `kNotResident` and admission restarts at the bottom of each
+    /// layer's range (or slot 0, without per-layer admission).  The caller is expected to refill each slot it
+    /// re-admits - the bytes already in the arena belong to the previous phase's experts and are not what any
+    /// new entry claims.
+    void clear_residency();
+
     /// Publish a same-layer replacement after its slot copy has completed.
     void replace(int64_t layer, int32_t old_expert, int32_t new_expert) {
         auto& old = residency_[(size_t) layer * n_expert_ + old_expert];

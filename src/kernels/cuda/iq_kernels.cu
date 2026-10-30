@@ -9,6 +9,8 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
+#include "strata/kernels/nvfp4_q8_0_cpu_order.hpp"   // native_expert_grouped_q8_0: the pool-order dot products
+#include "strata/kernels/quantize_act.hpp"           // quantize_q8_0: the phase-1 -> phase-2 handoff
 #include "s26_tsum.cuh"
 
 #include <cuda_fp16.h>
@@ -3561,6 +3563,11 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
 }
 
+size_t native_expert_hq_off(int64_t cap, int64_t width) {
+    const size_t f = (size_t) cap * (size_t) width * sizeof(float);
+    return 3 * ((f + 255) & ~(size_t) 255);
+}
+
 
 // The AMD layouts below (STRATA_EXP_MODE) also build for CUDA: Volta takes mode 8 by default (exp_mode), every
 // other CUDA card keeps mode 0, the CUDA layout above.
@@ -4447,6 +4454,66 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// THE CPU-POOL-ORDER ENTRY POINT.  Same layout, same two-phase protocol, same scratch carving as
+// `native_expert_grouped` above - but the activation is `block_q8_0` (the pool's own contract) and the two dot
+// products are `nvfp4_q8_0_grouped_{gu,down}` (nvfp4_q8_0_cpu_order.cu), which reproduce `nvfp4_256_{gu_,}rows`
+// bit for bit.  This exists so a GPU hit and a CPU miss produce the SAME number, which is what makes residency
+// a performance knob instead of a correctness one.
+//
+// WHY A SEPARATE ENTRY POINT RATHER THAN A FLAG INSIDE `native_expert_grouped`.  That function dispatches on the
+// GGUF type through `launch_gu<T>`/`launch_down<T>` and every one of those takes `const block_q8_1*`; threading a
+// second activation format through them would touch every kernel in the file.  This one has exactly one
+// implementation (NVFP4 gu/down) and forwards to it.
+//
+// PHASES (the same `g_exp_phase` values the caller already sets with `native_expert_set_mode`):
+//   1 = gate/up + SwiGLU into `h`, then quantize `h` into `hq`; return.
+//   2 = down only, reading the `hq` phase 1 left at `scratch + 3*fa`.
+//   0 = both, back to back (a single-card window).
+// The intermediate quantizer is `quantize_q8_0`, which the parity test proves byte-identical to the ggml
+// `from_float` the CPU pool runs (0 / 4080 bytes), so the split's handoff introduces no drift of its own.
+void native_expert_grouped_q8_0(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                                const uint8_t* x_q8_0, int act_stride, void* scratch, float* out, void* stream,
+                                int phase, int64_t grid_groups) {
+    if (cap_groups <= 0 || cap_entries <= 0) return;
+    if (L.gu_type != 40 || L.d_type != 40) {
+        std::fprintf(stderr, "native_expert_grouped_q8_0: the pool-order path is NVFP4 only (%d/%d)\n", L.gu_type,
+                     L.d_type);
+        std::exit(1);
+    }
+    if (L.n_ff % 64 != 0 || L.n_embd % 64 != 0) {
+        std::fprintf(stderr, "native_expert_grouped_q8_0: n_ff %lld / n_embd %lld is not a multiple of 64\n",
+                     (long long) L.n_ff, (long long) L.n_embd);
+        std::exit(1);
+    }
+    cudaStream_t s = (cudaStream_t) stream;
+    const int64_t cap = cap_entries;
+    const size_t f = (size_t) cap * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
+    float* h = (float*) ((uint8_t*) scratch + 2 * fa);
+    uint8_t* hq = (uint8_t*) scratch + 3 * fa;
+
+    if (phase != 2) {
+        nvfp4_q8_0_grouped_gu(grp_ptr, grp_start, n_groups, ent_tok, cap_groups, cap, L.n_embd, L.n_ff, L.gu_row,
+                              L.up_off, L.tail_off, x_q8_0, act_stride, h, s);
+        // hq is one Q8_0 row of n_ff per entry, and the gu wrote the SwiGLU product into `h` in the same
+        // [entry][row] order, so the quantization is a plain contiguous pass.
+        quantize_q8_0(h, hq, cap * L.n_ff, s);
+        check("native_expert_grouped_q8_0/gu+quant");
+    }
+    if (phase == 1) return;
+
+    // The down reads the INTERMEDIATE, which phase 1 left as one Q8_0 row per entry, so its entry -> row map is
+    // the identity.  The caller's `ent_tok` is the TOKEN map (which activation row the gate/up read) and means
+    // something else entirely here; passing it through would make each entry read another entry's intermediate.
+    // Passing null selects the identity inside the kernel, which needs no buffer and no host array - the scratch
+    // is exactly `native_expert_scratch_bytes` and has no room for a map of its own.
+    nvfp4_q8_0_grouped_down(grp_ptr, grp_start, n_groups, ent_dst, nullptr, cap_groups, cap, L.n_embd, L.n_ff, L.d_row,
+                            L.down_off, L.tail_off, hq, (int) ((L.n_ff / 32) * 34), out, s);
+    check("native_expert_grouped_q8_0/down");
 }
 
 }  // namespace strata::kernels

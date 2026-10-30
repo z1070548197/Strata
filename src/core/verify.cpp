@@ -3,12 +3,14 @@
 #include "strata/core/sm75_series.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/window_evict.hpp"
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 #include "strata/core/host_graph_launch.hpp"
 #endif
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/spec_prob.hpp"
+#include "strata/core/gpu_busy.hpp"
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -53,10 +55,14 @@
 #include "strata/core/progress.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/core/tp_split.hpp"
+#include "strata/core/tp_split_plan.hpp"
+#include "strata/core/tp_blob_ranges.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <set>
 #include <mutex>
 #include <string>
 #include <optional>
@@ -91,6 +97,18 @@ using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
+
+/// STRATA_POOL_ORDER=1: run the resident experts through `native_expert_grouped_q8_0` instead of
+/// `native_expert_grouped`.  The two differ only in ARITHMETIC, not in result: the q8_0 path is a bit-exact
+/// transcription of the CPU pool (same Q8_0 blocks, same fp32 FMA order, same hsum8 tree, glibc's SiLU expf),
+/// while the q8_1 path keeps 16-lane fp16 partials and CUDA's `__expf`.  With it on, a resident expert and a
+/// missed one return the same number, so changing which experts are resident no longer changes the tokens -
+/// which is what has blocked raising residency for speed.  OFF by default: it changes the output tokens of the
+/// existing path, so it must be opted into (and the acceptance run compares against the solo tokens WITH it on).
+inline bool g_pool_order() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_POOL_ORDER"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 // STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9): residency-biased routing.
 struct RouteResidentCfg;
 RouteResidentCfg& route_resident_cfg();
@@ -176,6 +194,38 @@ inline bool g_qfuse_hc() {
     return false;
 #endif
 }
+// STRATA_GRAPH_PRIO=1 (opt-in): the window graph's kernel nodes keep their capturing stream's
+// priority (side_ high, sh_cs_ low).  Unset / 0: every node at the launch stream's priority, as before.
+[[maybe_unused]] inline bool graph_prio_on() {   // (every HIP caller is guarded off)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+    return false;
+#else
+    static const bool on = [] { const char* v = std::getenv("STRATA_GRAPH_PRIO"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+#endif
+}
+// STRATA_GRAPH_PRIO: the capture and graph queries by CUDA version (13 renamed the edge-data forms: the same split as
+// verify_kernels.cu's and the PDL edge check above).  Nothing is returned for the edge data.
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+inline cudaError_t prio_capture_deps(cudaStream_t s, cudaStreamCaptureStatus* st, const cudaGraphNode_t** deps, size_t* n) {
+#if CUDART_VERSION >= 13000
+    return cudaStreamGetCaptureInfo(s, st, nullptr, nullptr, deps, nullptr, n);
+#elif CUDART_VERSION >= 12030
+    return cudaStreamGetCaptureInfo_v3(s, st, nullptr, nullptr, deps, nullptr, n);
+#else
+    return cudaStreamGetCaptureInfo_v2(s, st, nullptr, nullptr, deps, n);
+#endif
+}
+inline cudaError_t prio_node_deps(cudaGraphNode_t node, cudaGraphNode_t* deps, size_t* n) {
+#if CUDART_VERSION >= 13000
+    return cudaGraphNodeGetDependencies(node, deps, nullptr, n);
+#elif CUDART_VERSION >= 12030
+    return cudaGraphNodeGetDependencies_v2(node, deps, nullptr, n);
+#else
+    return cudaGraphNodeGetDependencies(node, deps, n);
+#endif
+}
+#endif
 // fork 34a35db + b063c13 (Eddoursul), STRATA_SIDE_MIXER=1 / =2 (opt-in): the mixer's work that reads only the layer's
 // input on branches of the window's graph (bitwise the same outputs); 0 / unset = in line, and no branch stream is created
 inline int g_side_mixer() { static const int m = [] { const char* v = std::getenv("STRATA_SIDE_MIXER"); return v ? std::max(0, std::min(2, std::atoi(v))) : 0; }(); return m; }
@@ -462,6 +512,21 @@ const int64_t g_test_drop = [] {
 }();
 }  // namespace
 
+// STRATA_TP_VEC=N: floats per dump site (0 = the scalar dumps only).  Both the solo and the TP window read it,
+// so their vector dumps have the same length and can be diffed element by element.
+int Verifier::tp_vec_len() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_TP_VEC");
+        const int k = v != nullptr ? std::atoi(v) : 0;
+        // The sites are [T][N] buffers, so a width below T*N silently drops whole tokens: N alone (2560) covers
+        // only token 0, and the 2048 this used to default to hid both token 1 and columns 2048..2559 - an
+        // "l0 is bit-exact" reading off that dump was only 80% of one token.  The ceiling is the largest window
+        // (6 tokens x 2560 = 15360) so any window can be dumped in full.
+        return k > 0 && k <= 16384 ? k : 0;
+    }();
+    return n;
+}
+
 bool Verifier::release_gpu_waits(int timeout_ms) {
     released_.store(true);
     trace_ev("RELEASE", -1, -1, timeout_ms);
@@ -572,6 +637,7 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    if (pcie_st_) cudaFree(pcie_st_);
     for (auto& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     for (auto& e : exec_nr_)
@@ -610,6 +676,42 @@ Verifier::~Verifier() {
                      h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
+}
+
+// STRATA_PCIE_TIMING: turn this window's stamp pairs into ms_pcie.  Only call it once cs_ has been synchronized:
+// every pair brackets a fetch on that stream, so the stamps are final.
+void Verifier::drain_pcie_timing() {
+    if (!pcie_timed_) return;
+    if (pcie_pairs_ == 0 || pcie_st_ == nullptr) {
+        static bool said = false;   // a zero here means the capture recorded no fetch at all: say WHY once
+        if (!said) {
+            said = true;
+            std::fprintf(stderr,
+                         "strata pcie timing: the recorded window carries no stamp pairs (pcie_mode %d, pcie_n %d)\n",
+                         (int) sink_.pcie_mode, pcie_n_);
+        }
+        return;
+    }
+    const size_t words = (size_t) 2 * pcie_pairs_;
+    if (pcie_h_.size() < words) return;
+    if (cudaMemcpy(pcie_h_.data(), pcie_st_, words * sizeof(unsigned long long), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaGetLastError();   // a window cut short by an error: count nothing
+        return;
+    }
+    double sum = 0;
+    size_t nonmono = 0;
+    for (size_t i = 0; i < (size_t) pcie_pairs_; ++i) {
+        const unsigned long long t0 = pcie_h_[2 * i], t1 = pcie_h_[2 * i + 1];
+        if (t1 > t0) sum += (double) (t1 - t0) / 1e6;   // %globaltimer counts ns (gpu_stamp normalizes HIP's too)
+        else ++nonmono;
+    }
+    static bool said = false;   // first read-back of a stamped window: the numbers, once
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "strata pcie timing: %d pairs, first t0=%llu t1=%llu (%zu non-monotonic), %.3f ms\n",
+                     pcie_pairs_, pcie_h_[0], pcie_h_[1], nonmono, sum);
+    }
+    ms_pcie += sum;
 }
 
 bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) {
@@ -721,6 +823,19 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
+    // STRATA_TP_DUMP=1: a per-layer copy of the residual's head, to diff a TP run against a single-card one.
+    // STRATA_TP_VEC=N (>0) appends N floats per dump site past kTpVecOff: the head of a layer whose values are
+    // near zero says nothing about the layer, and a per-layer scalar cannot tell a wrong sum from a wrong shape.
+    if (std::getenv("STRATA_TP_DUMP") != nullptr) {
+        // the vectors need (n_layers + 1) rows: the head's input is dumped as one more layer's site 2.  They start
+        // at kTpVecOff, not right after the scalars, so the block is kTpVecOff + vec floats.
+        const int64_t vec = tp_vec_len() > 0 ? (g.n_layers + 1) * kTpVecSites * tp_vec_len() : 0;
+        const int64_t nfl = vec > 0 ? kTpVecOff + vec : (int64_t) g.n_layers * 8 + 564;
+        if (!mapped((size_t) nfl * sizeof(float), (void**) &h_tpdump_, (void**) &m_tpdump_)) {
+            err = "verify: the TP diagnosis buffer could not be allocated";
+            return false;
+        }
+    }
     if (bal_ != nullptr) {   // set_pcie_balance: four stamp words per (layer, group)
         if (!mapped((size_t) g.n_layers * 2 * 4 * 8, (void**) &h_bal_, (void**) &m_bal_)) {
             err = "verify: mapped balance stamps allocation failed";
@@ -835,6 +950,19 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
         else { cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0); }
     }
+    pcie_timed_ = std::getenv("STRATA_PCIE_TIMING") != nullptr;
+    if (pcie_timed_ && pcie_st_ == nullptr) {
+        const size_t words = (size_t) 2 * kPcieTimingMax;
+        if (cudaMalloc((void**) &pcie_st_, words * sizeof(unsigned long long)) != cudaSuccess) {
+            pcie_timed_ = false; pcie_st_ = nullptr; cudaGetLastError();
+            std::fprintf(stderr, "strata pcie timing: cudaMalloc failed, off\n");
+        } else {
+            cudaMemset(pcie_st_, 0, words * sizeof(unsigned long long));
+            pcie_h_.assign(words, 0);
+            std::fprintf(stderr, "strata pcie timing: armed on device %d from layer %d (mode %d)\n",
+                         device_, (int) le_, (int) sink_.pcie_mode);
+        }
+    }
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
@@ -848,9 +976,24 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
+    // STRATA_GRAPH_PRIO=1 (opt-in): the window's streams carry priorities that their captured kernel
+    // nodes keep (the window graph is instantiated with cudaGraphInstantiateFlagUseNodePriority): the GDN gates / QSA
+    // indexer branch (side_) at the device's highest, cs_ and side2_ in the middle, the shared expert (sh_cs_) at the
+    // lowest (= the default).  The indexer chain's 1-block kernels are then dispatched ahead of the q GEMV's queued
+    // blocks, and the shared expert behind the experts.  Unset: every stream at the default priority, as before.
+    int gp_lo = 0, gp_hi = 0;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    const bool gprio = graph_prio_on() && cudaDeviceGetStreamPriorityRange(&gp_lo, &gp_hi) == cudaSuccess && gp_lo != gp_hi;
+    if (graph_prio_on() && !gprio) (void) cudaGetLastError();   // (only a failed range query's error: unset clears nothing)
+#else
+    const bool gprio = false;   // (HIP: the default priority, as make_stream's below)
+#endif
+    const int gp_mid = gprio ? (gp_lo + gp_hi) / 2 : 0;
+    if (gprio) std::fprintf(stderr, "strata verify: STRATA_GRAPH_PRIO: stream priorities side %d, cs / side2 %d, shared expert %d\n",
+                            gp_hi, gp_mid, gp_lo);
     // STRATA_PIPED_CONCURRENT=1 (opt-in): a prompt can run on the same GPU while the batch windows run, so the windows'
     // streams get the device's highest priority (HIP: the default priority, as the drafter's)
-    auto make_stream = [](cudaStream_t* s) -> cudaError_t {
+    auto make_stream = [&](cudaStream_t* s, int gp = 0) -> cudaError_t {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
         static const bool hi = [] {   // (STRATA_PIPED_CONCURRENT_PRIO=0: the default priority)
             const char* v = std::getenv("STRATA_PIPED_CONCURRENT");
@@ -864,6 +1007,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                 return cudaSuccess;
             cudaGetLastError();   // (only the failed priority call's error: the default path clears nothing)
         }
+        if (gprio) {   // STRATA_GRAPH_PRIO: this stream's own priority (gp)
+            if (cudaStreamCreateWithPriority(s, cudaStreamNonBlocking, gp) == cudaSuccess) return cudaSuccess;
+            cudaGetLastError();
+        }
+#else
+        (void) gp;
 #endif
         return cudaStreamCreateWithFlags(s, cudaStreamNonBlocking);
     };
@@ -885,8 +1034,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     if (ext_stream_ != nullptr) cs_ = ext_stream_;   // set_stream (pipelined windows): the stage's shared stream
-    else if (make_stream(&cs_) != cudaSuccess) cs_ = nullptr;
-    if (cs_ == nullptr || make_stream(&sh_cs_) != cudaSuccess) {
+    else if (make_stream(&cs_, gp_mid) != cudaSuccess) cs_ = nullptr;
+    if (cs_ == nullptr || make_stream(&sh_cs_, gp_lo) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
     }
@@ -932,10 +1081,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
     }
     if (g_side_mixer() > 0 &&
-        (cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking) != cudaSuccess ||
+        ((gprio ? make_stream(&side_, gp_hi) : cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking)) != cudaSuccess ||
         cudaEventCreateWithFlags(&mfork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&mjoin_, cudaEventDisableTiming) != cudaSuccess ||
-        cudaStreamCreateWithFlags(&side2_, cudaStreamNonBlocking) != cudaSuccess ||
+        (gprio ? make_stream(&side2_, gp_mid) : cudaStreamCreateWithFlags(&side2_, cudaStreamNonBlocking)) != cudaSuccess ||
         cudaEventCreateWithFlags(&pfork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&pjoin_, cudaEventDisableTiming) != cudaSuccess)) {
         err = "verify: the mixer branch's stream / events could not be created";
@@ -987,6 +1136,22 @@ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) 
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
 bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+    // STRATA_PCIE_TIMING: once this returns, the stamp pairs are graph nodes - every launch of the graph rewrites
+    // them, so the window's drain reads that launch.  A scope guard because the function has an early return per
+    // error, and a half-recorded graph must not leave a count behind.
+    struct PcieStampScope {
+        int* n;
+        int* pairs;
+        ~PcieStampScope() {
+            if (*n > 0) *pairs = *n;
+            static bool said = false;   // what the capture actually recorded, once per process
+            if (!said) {
+                said = true;
+                std::fprintf(stderr, "strata pcie timing: the recorded window carries %d stamp pairs\n", *n);
+            }
+            *n = 0;
+        }
+    } pcie_stamp_scope{&pcie_n_, &pcie_pairs_};
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const WeightTable& wt = *wt_;
@@ -1011,6 +1176,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool side_mixer = side_mixer_mode >= 1;
     const bool side_proj = side_mixer_mode >= 2 && !batch_rec_;   // fork b063c13: the GDN gate projection, the QSA queries
     auto branch = [&](cudaEvent_t e, cudaStream_t from, cudaStream_t to, const char* what) {
+        if (to == side_) note_prio_fork(from);   // STRATA_GRAPH_PRIO: where the high-priority branch leaves cs
         if (cudaEventRecord(e, from) == cudaSuccess && cudaStreamWaitEvent(to, e, 0) == cudaSuccess) return true;
         err = std::string("verify: the mixer branch could not ") + what;
         return false;
@@ -1314,6 +1480,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
                                  (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
                                  (int) HV, n, side_);
+                    note_prio_tail(side_, 1);
                     if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the GDN gates' branch could not join"; return false; }
                 }
                 if (!q8_attn) quant_in(xm, (int) N);
@@ -1366,6 +1533,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 else
                 gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
                                   self_commit);
+                if (m_tpdump_ != nullptr && grp == 0 && l == 0) {   // DIAG: the solo GDN qkv + conv output
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 548), qkv, 4 * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 552), qkv + 2048, 4 * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 556), qkv + 4096, 4 * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 560), hb, 4 * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
+                }
                 stamp(l, 3, grp);
                 if (br) {   // gate, beta and z, before the recurrence reads them
                     join(0);
@@ -1597,6 +1774,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     idx_append(side_);
                     idx_query(side_);
                     idx_select(side_);
+                    note_prio_tail(side_, 1);
                     if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the indexer's branch could not join"; return false; }
                 }
                 if (side_proj) {   // the queries beside the keys and values (fork b063c13)
@@ -1623,6 +1801,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                     mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 }
+                if (m_tpdump_ != nullptr && grp == 0 && l == 3 && tb == 0) {   // DIAG: the k/v weight heads and the raw (pre-norm) k/v
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 528), wk->native_data, 16, cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 532), wv->native_data, 16, cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 536), wq->native_data, 16, cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 540), kcur_ + tb * NKV * HD, 4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 544), vcur_ + tb * NKV * HD, 4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                }
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
@@ -1632,6 +1817,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                 }
                 stamp(l, 8, grp);
+                if (m_tpdump_ != nullptr && grp == 0 && l == 3 && tb == 0) {   // DIAG: the l3 intermediates, vs the TP path
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 492), kcur_, 4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 496), vcur_, 4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                }
                 if (!sidem) idx_snap(cs);
                 // #783 PR-d (stuchapin909): the window's K/V cells in one launch per pool instead of one per token (a
                 // batch's rows each have their own K/V, so that case keeps the loop)
@@ -1689,6 +1878,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (!sidem) idx_query(cs);
                 }
                 stamp(l, 10, grp);
+                if (m_tpdump_ != nullptr && grp == 0 && l == 3 && tb == 0)
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 504), qidx_ + tb * IQ * ID, 4 * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
                 bool streamed = false;   // a streamed KV cache keeps the per-row resolve-then-attend order
                 if (batch_rec_ && g_qsa_slots)
                     for (int t = tb; t < te; ++t) streamed = streamed || slot_ss(t).qsa_states[qi].kv_mode == 1;
@@ -1778,10 +1970,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     return false;
                 }
                 stamp(l, 11, grp);
+                if (m_tpdump_ != nullptr && grp == 0 && l == 3 && tb == 0) {
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 508), scores_ + (size_t) tb * max_blocks_, 4 * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 512), sel_ + (size_t) tb * cap_, 4 * sizeof(int32_t),
+                                    cudaMemcpyDeviceToHost, cs);
+                }
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
                 stamp(l, 12, grp);
                 if (qbr) join(0);   // the query, for attention
+                if (m_tpdump_ != nullptr && grp == 0 && l == 3 && tb == 0)
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 500), qcur_ + tb * NH * HD, 4 * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
                 const QsaAttnPools pools = qsa_attn_pools(st);
                 // STRATA_QSA_SPLIT_ATTN=1: the split tensor-core attention where it applies (int8 KV, sm_80+)
                 static const bool split_attn = [] { const char* v = std::getenv("STRATA_QSA_SPLIT_ATTN"); return v != nullptr && std::atoi(v) != 0; }();
@@ -1793,6 +1994,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 }
                 stamp(l, 13, grp);
+                if (m_tpdump_ != nullptr && grp == 0 && l == 3 && tb == 0)
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 516), attn_ + tb * NH * HD, 4 * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
                 if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
                                               (int) (n * NH), (int) HD, cs);
@@ -1815,6 +2019,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 16, grp);
         const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
+        if (m_tpdump_ != nullptr && grp == 0 && l < 2)   // DIAG: the single-card MoE input (half 1), same slot as the TP path
+            cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 100) + (size_t) l * 4, mixed_ + tb * N, 4 * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
+        if (m_tpdump_ != nullptr && grp == 0 && l == 3)   // DIAG: the l3 MoE input, vs the TP path
+            cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 524), mixed_ + tb * N, 4 * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
+        // DIAG (STRATA_TP_VEC=N): site 0, this layer's mixer output in full, so the two paths' MoE inputs can be
+        // compared as vectors rather than by their first four floats
+        if (const int64_t vat = tp_vec_at(l, 0); vat >= 0 && grp == 0)
+            cudaMemcpyAsync(m_tpdump_ + vat, mixed_ + tb * N, (size_t) tp_vec_len() * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
         static const bool sh_fork_late_env = [] {
@@ -1825,6 +2040,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool sh_fork_late = sh_fork && sh_fork_late_env && !ar_on();
         cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
         if (sh_fork && !sh_fork_late) {
+            note_prio_fork(cs);
             cudaEventRecord(ev_fork_, cs);
             cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
         }
@@ -1901,6 +2117,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                      m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
             }
             if (sh_fork_late) {
+                note_prio_fork(cs);
                 cudaEventRecord(ev_fork_, cs);
                 cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
             }
@@ -1938,14 +2155,29 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
             }
-            if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
+            if (sh_fork) {
+                note_prio_tail(sh_cs_, -1);
+                cudaEventRecord(ev_join_, sh_cs_);
+            }
         }
         if (strata::kernels::cpu::expert_layout().native) {
             if (!qdedup)
                 if (!q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+            // STRATA_POOL_ORDER=1: also produce the pool's OWN activation contract.  `hit_xq_` already exists for
+            // this (the non-native path's buffer) and `quantize_q8_0` is byte-identical to the pool's `from_float`
+            // (nvfp4_q8_0_entry_parity asserts it), so a resident expert and a missed one then compute the same
+            // number and the resident SET can change without changing the tokens.
+            if (g_pool_order() && !q8_ffn)
+                quantize_q8_0(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, (int64_t) n * N, cs);
         } else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
         stamp(l, 18, grp);
+        if (m_tpdump_ != nullptr && grp == 0 && l < 2) {   // DIAG: see the TP window's dump
+            cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 72) + (size_t) l * 8, ids_ + tb * K,
+                            4 * sizeof(int32_t), cudaMemcpyDeviceToHost, cs);
+            cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 72) + (size_t) l * 8 + 4, w_ + tb * K,
+                            4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+        }
         return true;
     };
 
@@ -1979,6 +2211,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
                 const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                if (g_pool_order() && f.gu_type == 40 && f.d_type == 40) {
+                    // THE POOL-ORDER PATH: the same number a CPU miss produces, so residency stops being a
+                    // correctness knob.  Its activation is `block_q8_0`, quantized here from the same `xm`.
+                    native_expert_grouped_q8_0(L, gp, gs, gn, p_dst, p_tok, cap, cap,
+                                               hit_xq_ + (size_t) tb * (N / 32) * 34, (int) ((N / 32) * 34),
+                                               hit_scratch_, dst_buf, cs, 0, gy);
+                } else
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy);
             } else {
@@ -2017,8 +2256,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
                 const unsigned long long* p_dst2 = (const unsigned long long*) (pl + dst2_off_);   // STRATA_ADAPT_FETCH
+                const bool pcie_t = pcie_timed_ && pcie_n_ < kPcieTimingMax;   // STRATA_PCIE_TIMING: this H2D, timed
+                if (pcie_t) gpu_stamp(pcie_st_, 2 * pcie_n_, cs);
                 fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs, p_dst2);
                 rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs, p_dst2);
+                if (pcie_t) {
+                    gpu_stamp(pcie_st_, 2 * pcie_n_ + 1, cs);
+                    ++pcie_n_;
+                }
             }
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
@@ -2074,6 +2319,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
                 native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+                if (m_tpdump_ != nullptr && grp == 0 && l < 2)   // DIAG: this window's combine
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 40) + (size_t) l * 4, bo_ + tb * N,
+                                    4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         for (int t = tb; t < te; ++t) {
@@ -2084,6 +2332,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         stamp(l, 24, grp);
+        // STRATA_TP_DUMP=1: the residual's head, per layer (see h_tpdump_)
+        if (m_tpdump_ != nullptr && grp == 0)
+            cudaMemcpyAsync(m_tpdump_ + (size_t) l * 8, bo_ + tb * N, 8 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+        // DIAG (STRATA_TP_VEC=N): site 1, this layer's combined residual in full (the sum of both halves plus
+        // the shared expert - the value every later layer reads)
+        if (const int64_t vat = tp_vec_at(l, 1); vat >= 0 && grp == 0)
+            cudaMemcpyAsync(m_tpdump_ + vat, bo_ + tb * N, (size_t) tp_vec_len() * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
                 if (dec_batch && !g_no_multi_gr) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
@@ -2184,6 +2440,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         if (head_ != nullptr && head_->loaded()) {
             try {
+                // DIAG (STRATA_TP_VEC=N): site 2, the head's input (the final mixer's output) in full: a head whose
+                // logits come out too small is either fed a too-small vector or reading the wrong weights
+                if (const int64_t vat = tp_vec_at(g.n_layers, 2); vat >= 0)
+                    cudaMemcpyAsync(m_tpdump_ + vat, head_mixed_, (size_t) tp_vec_len() * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
                 native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
                 if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
                     if (T >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) T, cs);
@@ -2212,6 +2473,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     }
     stamp(g.n_layers, 1, 0);
     return true;
+}
+
+// The TP peer's own stage line.  Rank 0's report shows what rank 0 waited for; the wait's OTHER half (what rank 1 was
+// doing while rank 0 spun) only exists on rank 1's device.  The stamps are written by rank 1's captured graph, so the
+// device must be drained before the read-back (the graph's last kernels may still be in flight) - profiling only.
+std::string Verifier::peer_profile_report() {
+    if (!prof_on_ || tp_peer_ == nullptr || !tp_peer_->prof_on_) return std::string();
+    {
+        const OnDevice on_peer(tp_peer_->device_);
+        (void) cudaDeviceSynchronize();
+    }
+    tp_peer_->collect_profile();
+    return tp_peer_->profile_report();
 }
 
 std::string Verifier::profile_report() {
@@ -2273,6 +2547,10 @@ bool Verifier::capture(int T, std::string& err) {
         err = "verify: begin capture failed";
         return false;
     }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    prio_forks_.clear();
+    prio_tails_.clear();
+#endif
     std::string rerr;
     const bool ok = record_window(T, cs_, rerr);
     cudaGraph_t graph = nullptr;
@@ -2383,145 +2661,42 @@ bool Verifier::capture(int T, std::string& err) {
 #endif
     }
 #endif
-    const bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err);
+    unsigned long long iflags = 0;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    if (graph_prio_on()) {   // STRATA_GRAPH_PRIO: the nodes run at their own (captured or repaired) priorities
+        apply_node_priorities(graph, T);
+        iflags = cudaGraphInstantiateFlagUseNodePriority;
+    }
+#endif
+    bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err, T, iflags);
+    if (!made && iflags != 0) {   // a driver / card that rejects the flag must not take the engine down (opt-in only)
+        std::fprintf(stderr, "strata verify: instantiate with node priorities failed (%s); retried at the default\n", err.c_str());
+        (void) cudaGetLastError();
+        exec_t = nullptr;
+        err.clear();
+        made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err, T, 0);
+    }
     cudaGraphDestroy(graph);
     if (!made) return false;
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
                  cudaGetErrorString(ue), cudaGetErrorString(us));
+    // The upload only warms the graph; the first launch does it otherwise. A failed one (out of memory on a full card)
+    // must not stay pending: the next kernel wrapper's cudaGetLastError would read it and end the engine (#3702).
+    if (ue != cudaSuccess || us != cudaSuccess) {
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "strata verify: the %d-token window's upload was skipped (the first launch does it)\n", T);
+    }
     return true;
 }
 
-bool Verifier::capture_commit(std::string& err) {
-    if (commit_exec_ != nullptr) return true;
-    using namespace strata::kernels;
-    const ModelGeometry& g = *g_;
-    SessionState& ss = *ss_;
-    const QsaShapes s = shapes_of(g);
-    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ID = g.idx_key_dim, MT = max_t_;
-    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
-    const int64_t TS = (s.idx_block - 1) * ID;
-    const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-        err = "verify: begin commit capture failed";
-        return false;
-    }
-    bool ok = true;
-    try {
-        copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
-        int64_t qsa_index = 0, gdn_index = 0;
-        for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
-        // engine-latency (STRATA_COMMIT_BATCH, default on; =0 keeps the per-layer loop): every GDN layer's conv history and
-        // state in two launches instead of two per layer (~70 graph nodes fewer; the same arithmetic per layer, bitwise).
-        // The commit runs between a window and the draft round, which on HIP waits for it.
-#if defined(STRATA_GPU_METAL)   // no batched commit kernels on Metal: the per-layer loop (the Mac engine's gated path)
-        static const bool commit_batch = false;
-#else
-        static const bool commit_batch = [] { const char* e = std::getenv("STRATA_COMMIT_BATCH"); return !e || e[0] != '0'; }();
-#endif
-        bool gdn_batched = false;
-        if (commit_batch) {
-            int64_t n_gdn = 0;
-            bool norms_ok = true;   // the per-layer loop checks each layer's ssm_norm.weight: keep that check
-            for (int64_t l = lb_; l < le_ && norms_ok; ++l)
-                if (!is_qsa_layer(g, l)) {
-                    ++n_gdn;
-                    norms_ok = need(LayerView(*wt_, l), "ssm_norm.weight", err) != nullptr;
-                }
-            if (!norms_ok) ok = false;
-            else if (n_gdn > 0)
-                gdn_batched = gdn_commit_layers(
-                    ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
-                    (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t) gdn_index * MT * C,
-                    MT * C, h_L_ + (size_t) gdn_index * MT * C, MT * C, gate_L_ + (size_t) gdn_index * MT * HV,
-                    beta_L_ + (size_t) gdn_index * MT * HV, MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT,
-                    (int) n_gdn, commit_, cs_);
-        }
-        // the QSA layers' tail restore + indexer append, one launch for all of them (one block per layer)
-        bool qsa_batched = false;
-        if (commit_batch && ok && !g_no_batch_kv) {
-            QsaIndexerLayers il;
-            int nq = 0;
-            int64_t mc = -1;
-            bool fits = true;
-            for (int64_t l = lb_, qi = qsa_index; l < le_ && fits; ++l) {
-                if (!is_qsa_layer(g, l)) continue;
-                const WeightRef* wikn = need(LayerView(*wt_, l), "indexer.k_norm.weight", err);
-                if (!wikn) { ok = false; fits = false; break; }
-                const QsaState& st = ss.qsa_states[qi];
-                if (nq >= QsaIndexerLayers::kMax || (mc >= 0 && st.max_cells != mc)) { fits = false; break; }
-                mc = st.max_cells;
-                il.gamma[nq] = (const float*) wikn->data;
-                il.tail_src[nq] = tail_snap_ + (size_t) qi * TS;
-                il.tail[nq] = st.idx_tail; il.dead[nq] = st.idx_dead; il.pooled[nq] = st.idx_pooled;
-                il.block_pos[nq] = st.idx_block_pos;
-                ++nq;
-                ++qi;
-            }
-            if (ok && fits && nq > 0) {
-                native_qsa_indexer_append_steps_layers(idx_raw_L_ + (size_t) qsa_index * MT * ID, MT * ID, commit_ + 2, 1,
-                                                       (int) MT, 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
-                qsa_batched = true;
-            }
-        }
-        for (int64_t l = lb_; l < le_ && ok; ++l) {
-            const LayerView v(*wt_, l);
-            if (is_qsa_layer(g, l) && qsa_batched) {
-                ++qsa_index;
-            } else if (!is_qsa_layer(g, l) && gdn_batched) {
-                ++gdn_index;
-            } else if (!is_qsa_layer(g, l)) {
-                const WeightRef* wnm = need(v, "ssm_norm.weight", err);
-                if (!wnm) { ok = false; break; }
-                float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
-                float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                const float* qkv = qkv_L_ + (size_t) gdn_index * MT * C;
-                gdn_conv_commit(conv, qkv, (int) C, commit_, cs_);
-                gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C, (int) C, gate_L_ + (size_t) gdn_index * MT * HV,
-                                    beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS, y_dummy_,
-                                    (int) g.ssm_k_heads, (int) HV, (int) MT, commit_, cs_,
-                                    (int) MT);   // S26: t_out_begin = MT - the replay's outputs (y_dummy_) are never read
-                ++gdn_index;
-            } else {
-                const QsaState& st = ss.qsa_states[qsa_index];
-                const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
-                if (!wikn) { ok = false; break; }
-                copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
-                const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                if (!g_no_batch_kv) {
-                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT, 0,
-                                                    (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
-                } else {
-                    for (int64_t t = 0; t < MT; ++t)
-                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
-                                                  (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                  rope_scaling(), cs_);
-                }
-                ++qsa_index;
-            }
-        }
-        if (ok && ss.ple.ready() && ple_stage()) copy_indexed(ss.ple.hist, hist_snap_, HS, commit_ + 1, HS, cs_);
-    } catch (const std::exception& e) {
-        err = std::string("verify commit: ") + e.what();
-        ok = false;
-    }
-    cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
-    if (!ok) {
-        if (graph) cudaGraphDestroy(graph);
-        return false;
-    }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_, graph, 0) != cudaSuccess) {
-        if (graph) cudaGraphDestroy(graph);
-        err = std::string("verify: commit capture: ") + cudaGetErrorString(ce);
-        return false;
-    }
-    cudaGraphDestroy(graph);
-    return true;
-}
-
+// ===================================== tensor parallelism (--tp) =====================================
+// The coordinator (rank 0) owns the pair's shared handshake flags: one mapped host word each, the same device
+// pointer on both cards.  `flag_b` is raised by rank 1 after its out-projection partial is complete; rank 0
+// spins on it before the allreduce.  `flag_a` is raised by rank 0 after the allreduce; rank 1 spins on it
+// before it reads the summed residual.  Both start at 0 and carry the global layer index + 1, so a window of
+// L layers raises 1..L and the next window overwrites the same sequence.
 void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
@@ -2553,6 +2728,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
 }
 
 void Verifier::collect_profile() {
+    const OnDevice on_self(device_);   // the peer's buffers are on ITS device: this runs for rank 1's object too
     cudaMemcpy(prof_h_.data(), prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost);
     accumulate_profile(prof_h_.data());
 }
@@ -2658,6 +2834,43 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
     return true;
 }
 
+bool Verifier::sample_window(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
+    using namespace strata::kernels;
+    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
+        SamplerParams sp = sampling_;
+        sp.counter = (uint64_t) pos0;
+        bool judged = false;
+        if (sampled && spec_q_ != nullptr && spec_nq_ > 0 && T > 1 && T <= kVerifyMaxT) {
+            if (d_spec_ == nullptr &&
+                cudaMalloc((void**) &d_spec_, (size_t) kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t)) !=
+                    cudaSuccess) {
+                (void) cudaGetLastError();
+                d_spec_ = nullptr;
+            }
+            if (d_spec_ != nullptr) {
+                const int nq = std::min(spec_nq_, T - 1);
+                int32_t* d_q = d_spec_ + kVerifyMaxT;
+                if (cudaMemcpyAsync(d_spec_, tokens + 1, (size_t) (T - 1) * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) ==
+                        cudaSuccess &&
+                    cudaMemcpyAsync(d_q, spec_q_, (size_t) nq * strata::core::kSpecQStride * sizeof(int32_t),
+                                    cudaMemcpyHostToDevice, cs_) == cudaSuccess)
+                    judged = sample_tokens_spec(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, d_spec_, d_q, nq,
+                                                m_out_, cs_);
+            }
+        }
+        spec_q_ = nullptr;
+        spec_nq_ = 0;
+        if (judged) ++spec_windows;
+        else sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+            err = "verify: the head sampling failed";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
 #if defined(STRATA_GPU_METAL)
@@ -2667,6 +2880,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 #endif
     using namespace strata::kernels;
     const OnDevice on_device(device_);
+    // STRATA_GPU_BUSY (opt-in): holds this device's clock up across the window's host-fed waits.  The
+    // scope is the window, so every early return below releases the kernel.  It runs on its own
+    // lowest-priority stream and touches no arithmetic - a token change here is not this feature's doing.
+    const GpuBusyScope gpu_busy_scope;
     last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
@@ -2891,6 +3108,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             cudaStreamSynchronize(copy_);
             copy_used_ = false;
         }
+        drain_pcie_timing();   // cs_ is synced: this window's H2D stamps are final
         if (!ok) return false;
         if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
         if (handoff_failed(err)) return false;   // a middle stage of three or more: its own hand-in
@@ -2932,6 +3150,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
         copy_used_ = false;
     }
+    drain_pcie_timing();   // cs_ is synced: this window's H2D stamps are final
     if (h_bal_ != nullptr && !all_resident_ && !bal_paused_) pcie_balance_window(steps, G);
     if (prof_on_ && G == 1) collect_profile();   // the window's GPU stage stamps
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
@@ -2942,41 +3161,62 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ++windows;
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
-    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
-        SamplerParams sp = sampling_;
-        sp.counter = (uint64_t) pos0;
-        // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
-        bool judged = false;
-        if (sampled && spec_q_ != nullptr && spec_nq_ > 0 && T > 1 && T <= kVerifyMaxT) {
-            if (d_spec_ == nullptr &&
-                cudaMalloc((void**) &d_spec_, (size_t) kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t)) !=
-                    cudaSuccess) {
-                (void) cudaGetLastError();
-                d_spec_ = nullptr;
-            }
-            if (d_spec_ != nullptr) {
-                const int nq = std::min(spec_nq_, T - 1);
-                int32_t* d_q = d_spec_ + kVerifyMaxT;
-                if (cudaMemcpyAsync(d_spec_, tokens + 1, (size_t) (T - 1) * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) ==
-                        cudaSuccess &&
-                    cudaMemcpyAsync(d_q, spec_q_, (size_t) nq * strata::core::kSpecQStride * sizeof(int32_t),
-                                    cudaMemcpyHostToDevice, cs_) == cudaSuccess)
-                    judged = sample_tokens_spec(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, d_spec_, d_q, nq,
-                                                m_out_, cs_);
-            }
-        }
-        spec_q_ = nullptr;
-        spec_nq_ = 0;
-        if (judged) ++spec_windows;
-        else sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
-            err = "verify: the head sampling failed";
-            return false;
-        }
-    }
+    if (!sample_window(T, tokens, pos0, err)) return false;
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     note_nonfinite(T, nullptr);
+    if (h_tpdump_ != nullptr) {
+        for (int64_t ll = 0; ll < 2; ++ll) {
+            const int32_t* id = (const int32_t*) (h_tpdump_ + (size_t) g.n_layers * 8 + 72 + (size_t) ll * 8);
+            const float* ww = h_tpdump_ + (size_t) g.n_layers * 8 + 72 + (size_t) ll * 8 + 4;
+            std::fprintf(stderr, "TPDUMP solo CMB l%lld %.9e  ROUTE ids=%d,%d,%d,%d w=%.6e,%.6e,%.6e,%.6e\n",
+                         (long long) ll, (double) h_tpdump_[(size_t) g.n_layers * 8 + 40 + (size_t) ll * 4],
+                         id[0], id[1], id[2], id[3], (double) ww[0], (double) ww[1], (double) ww[2], (double) ww[3]);
+        }
+        {
+            const float* m0 = h_tpdump_ + (size_t) g.n_layers * 8 + 100;
+            std::fprintf(stderr, "TPDUMP solo MOEIN l0 %.9e,%.9e | l1 %.9e,%.9e\n", (double) m0[0], (double) m0[1],
+                         (double) m0[4], (double) m0[5]);
+        }
+        {
+            const float* q3 = h_tpdump_ + (size_t) g.n_layers * 8 + 492;
+            const int32_t* sel3 = (const int32_t*) (h_tpdump_ + (size_t) g.n_layers * 8 + 512);
+            std::fprintf(stderr,
+                         "TPDUMP solo QSA3 k=%.9e,%.9e v=%.9e,%.9e q=%.9e,%.9e qi=%.9e,%.9e s=%.6e,%.6e sel=%d,%d,%d,%d attn=%.9e,%.9e\n",
+                         (double) q3[0], (double) q3[1], (double) q3[4], (double) q3[5],
+                         (double) q3[8], (double) q3[9], (double) q3[12], (double) q3[13],
+                         (double) q3[16], (double) q3[17],
+                         sel3[0], sel3[1], sel3[2], sel3[3], (double) q3[24], (double) q3[25]);
+            const float* m3 = h_tpdump_ + (size_t) g.n_layers * 8 + 524;
+            std::fprintf(stderr, "TPDUMP solo M3 %.9e,%.9e\n", (double) m3[0], (double) m3[1]);
+            const float* w3 = h_tpdump_ + (size_t) g.n_layers * 8 + 528;
+            std::fprintf(stderr, "TPDUMP solo W3 wk=%.9e,%.9e wv=%.9e,%.9e wq=%.9e,%.9e rk=%.9e,%.9e rv=%.9e,%.9e\n",
+                         (double) w3[0], (double) w3[1], (double) w3[4], (double) w3[5], (double) w3[8], (double) w3[9],
+                         (double) w3[12], (double) w3[13], (double) w3[16], (double) w3[17]);
+            const float* g0 = h_tpdump_ + (size_t) g.n_layers * 8 + 548;
+            std::fprintf(stderr, "TPDUMP solo GDN0 q=%.9e,%.9e k=%.9e,%.9e v=%.9e,%.9e h=%.9e,%.9e\n",
+                         (double) g0[0], (double) g0[1], (double) g0[4], (double) g0[5],
+                         (double) g0[8], (double) g0[9], (double) g0[12], (double) g0[13]);
+        }
+        std::fprintf(stderr, "TPDUMP solo T=%d pos0=%lld", T, (long long) pos0);
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            std::fprintf(stderr, " %.6e", (double) h_tpdump_[(size_t) l * 8]);
+        std::fprintf(stderr, "\n");
+        // STRATA_TP_VEC: the vector dumps as raw fp32, one file per window, appended in site order
+        if (const int64_t vat = tp_vec_at(0, 0); vat >= 0) {
+            const int nv = tp_vec_len();
+            static const char* vf = std::getenv("STRATA_TP_VEC_FILE");
+            static int vn = 0;
+            if (vf != nullptr) {
+                const std::string path = std::string(vf) + ".solo." + std::to_string(vn++);
+                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                    for (int64_t l = 0; l <= g.n_layers; ++l)
+                        for (int site = 0; site < kTpVecSites; ++site)
+                            std::fwrite(h_tpdump_ + tp_vec_at(l, site), sizeof(float), (size_t) nv, f);
+                    std::fclose(f);
+                }
+            }
+        }
+    }
     // debug: the first non-finite head (STRATA_DBG_NAN_VERIFY: this check alone, without the prompt path's)
     static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr || std::getenv("STRATA_DBG_NAN_VERIFY") != nullptr;
     if (dbg) {
@@ -3158,13 +3398,2561 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     return true;
 }
 
-namespace { bool g_commit_async = false; }
-void Verifier::set_commit_async(bool on) { g_commit_async = on && std::getenv("STRATA_COMMIT_SYNC") == nullptr; }
+bool Verifier::capture_commit(std::string& err) {
+    if (commit_exec_ != nullptr) return true;
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const QsaShapes s = shapes_of(g);
+    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ID = g.idx_key_dim, MT = max_t_;
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const int64_t TS = (s.idx_block - 1) * ID;
+    const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = "verify: begin commit capture failed";
+        return false;
+    }
+    bool ok = true;
+    try {
+        copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
+        int64_t qsa_index = 0, gdn_index = 0;
+        for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        // engine-latency (STRATA_COMMIT_BATCH, default on; =0 keeps the per-layer loop): every GDN layer's conv history and
+        // state in two launches instead of two per layer (~70 graph nodes fewer; the same arithmetic per layer, bitwise).
+        // The commit runs between a window and the draft round, which on HIP waits for it.
+#if defined(STRATA_GPU_METAL)   // no batched commit kernels on Metal: the per-layer loop (the Mac engine's gated path)
+        static const bool commit_batch = false;
+#else
+        static const bool commit_batch = [] { const char* e = std::getenv("STRATA_COMMIT_BATCH"); return !e || e[0] != '0'; }();
+#endif
+        bool gdn_batched = false;
+        if (commit_batch) {
+            int64_t n_gdn = 0;
+            bool norms_ok = true;   // the per-layer loop checks each layer's ssm_norm.weight: keep that check
+            for (int64_t l = lb_; l < le_ && norms_ok; ++l)
+                if (!is_qsa_layer(g, l)) {
+                    ++n_gdn;
+                    norms_ok = need(LayerView(*wt_, l), "ssm_norm.weight", err) != nullptr;
+                }
+            if (!norms_ok) ok = false;
+            else if (n_gdn > 0)
+                gdn_batched = gdn_commit_layers(
+                    ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
+                    (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size, qkv_L_ + (size_t) gdn_index * MT * C,
+                    MT * C, h_L_ + (size_t) gdn_index * MT * C, MT * C, gate_L_ + (size_t) gdn_index * MT * HV,
+                    beta_L_ + (size_t) gdn_index * MT * HV, MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT,
+                    (int) n_gdn, commit_, cs_);
+        }
+        // the QSA layers' tail restore + indexer append, one launch for all of them (one block per layer)
+        bool qsa_batched = false;
+        if (commit_batch && ok && !g_no_batch_kv) {
+            QsaIndexerLayers il;
+            int nq = 0;
+            int64_t mc = -1;
+            bool fits = true;
+            for (int64_t l = lb_, qi = qsa_index; l < le_ && fits; ++l) {
+                if (!is_qsa_layer(g, l)) continue;
+                const WeightRef* wikn = need(LayerView(*wt_, l), "indexer.k_norm.weight", err);
+                if (!wikn) { ok = false; fits = false; break; }
+                const QsaState& st = ss.qsa_states[qi];
+                if (nq >= QsaIndexerLayers::kMax || (mc >= 0 && st.max_cells != mc)) { fits = false; break; }
+                mc = st.max_cells;
+                il.gamma[nq] = (const float*) wikn->data;
+                il.tail_src[nq] = tail_snap_ + (size_t) qi * TS;
+                il.tail[nq] = st.idx_tail; il.dead[nq] = st.idx_dead; il.pooled[nq] = st.idx_pooled;
+                il.block_pos[nq] = st.idx_block_pos;
+                ++nq;
+                ++qi;
+            }
+            if (ok && fits && nq > 0) {
+                native_qsa_indexer_append_steps_layers(idx_raw_L_ + (size_t) qsa_index * MT * ID, MT * ID, commit_ + 2, 1,
+                                                       (int) MT, 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
+                qsa_batched = true;
+            }
+        }
+        for (int64_t l = lb_; l < le_ && ok; ++l) {
+            const LayerView v(*wt_, l);
+            if (is_qsa_layer(g, l) && qsa_batched) {
+                ++qsa_index;
+            } else if (!is_qsa_layer(g, l) && gdn_batched) {
+                ++gdn_index;
+            } else if (!is_qsa_layer(g, l)) {
+                const WeightRef* wnm = need(v, "ssm_norm.weight", err);
+                if (!wnm) { ok = false; break; }
+                float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
+                float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                const float* qkv = qkv_L_ + (size_t) gdn_index * MT * C;
+                gdn_conv_commit(conv, qkv, (int) C, commit_, cs_);
+                gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C, (int) C, gate_L_ + (size_t) gdn_index * MT * HV,
+                                    beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS, y_dummy_,
+                                    (int) g.ssm_k_heads, (int) HV, (int) MT, commit_, cs_,
+                                    (int) MT);   // S26: t_out_begin = MT - the replay's outputs (y_dummy_) are never read
+                ++gdn_index;
+            } else {
+                const QsaState& st = ss.qsa_states[qsa_index];
+                const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
+                if (!wikn) { ok = false; break; }
+                copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
+                const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                if (!g_no_batch_kv) {
+                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT, 0,
+                                                    (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
+                } else {
+                    for (int64_t t = 0; t < MT; ++t)
+                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
+                                                  (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                  rope_scaling(), cs_);
+                }
+                ++qsa_index;
+            }
+        }
+        if (ok && ss.ple.ready() && ple_stage()) copy_indexed(ss.ple.hist, hist_snap_, HS, commit_ + 1, HS, cs_);
+    } catch (const std::exception& e) {
+        err = std::string("verify commit: ") + e.what();
+        ok = false;
+    }
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    if (!ok) {
+        if (graph) cudaGraphDestroy(graph);
+        return false;
+    }
+    if (ce != cudaSuccess) {
+        if (graph) cudaGraphDestroy(graph);
+        err = std::string("verify: commit capture: ") + cudaGetErrorString(ce);
+        return false;
+    }
+    // (through the same path as the window graphs: on a full card it frees older batch layouts and retries, and the error
+    // it reports is the instantiate's own)
+    const bool made = instantiate_evicting(commit_exec_, graph, {}, "verify: commit instantiate: ", err, 0);
+    cudaGraphDestroy(graph);
+    return made;
+}
+
+// ---- STRATA_GDN_VALDUMP staging (file-scope, allocated in tp_setup_scratch OUTSIDE capture, D2H'd in-capture,
+// written at window-end).  The GDN out-projection runs INSIDE the CUDA graph capture, so the value vectors
+// (y_full_/y_tp_, DEVICE pointers in the cudaMalloc'd take() arena) must be pulled out with cudaMemcpyAsync into
+// PINNED host memory - exactly like the STRATA_TP_VEC site dumps (which fwrite the mapped buffer only OUTSIDE
+// capture, in run_tp).  A cudaStreamSynchronize + fwrite, or even a cudaHostAlloc, INSIDE capture is illegal: it
+// aborts the capture and poisons the stream ("operation failed due to a previous error during capture" at layer 0's
+// allreduce).  ONE process runs BOTH ranks (ver + tps.ver), so these are per-process and per-rank: each rank owns
+// its index and its files; the files are written from run_tp's window-end writer, after the graphs have replayed.
+namespace {
+float* g_gdnval_full_h_[2] = {nullptr, nullptr};   // [rank]: MT * ZV floats (pinned, persistent)
+float* g_gdnval_half_h_[2] = {nullptr, nullptr};   // [rank]: MT * ZVt floats (pinned, persistent)
+int    g_gdnval_T_ = 0;
+int    g_gdnval_ZV_ = 0;
+int    g_gdnval_ZVt_ = 0;
+int    g_gdnval_fired_[2] = {0, 0};   // set in-capture when a rank recorded its D2H; written once at window-end
+}  // namespace
+
+// ---- the TP scratch: this rank's half-width pipeline buffers, its local conv weights, and the experts' FFN
+// split (see tp_moe_split.hpp).  Everything here is allocated on THIS rank's device and launched on THIS
+// rank's stream: the coordinator may call it on the peer's verifier while another card is current.
+bool Verifier::tp_setup_scratch(std::string& err) {
+    if (!tp_on_) { err = "verify: tp_setup_scratch on a verifier that is not a TP rank"; return false; }
+    if (qkv_tp_ != nullptr) return true;   // said once
+    const OnDevice on_self(device_);
+    const ModelGeometry& g = *g_;
+    const WeightTable& wt = *wt_;
+    const int64_t HV = g.ssm_v_heads;                   // 48 global
+    const int64_t ZV = g.ssm_value_dim;                 // 6144 global
+    const int64_t NH = g.n_head, HD = g.head_dim;       // 24, 256
+    const int64_t MT = max_t_;
+    const int64_t nG = g.n_gdn_layers();
+    const int64_t Ct = strata::core::kTpGdnConvChannels;   // 7168 local conv channels
+    const int64_t HVt = HV / 2;                            // 24 local v-heads
+    const int64_t ZVt = ZV / 2;                            // 3072 local value dim
+    const int64_t NHt = NH / 2;                            // 12 local q heads
+    if ((HV % 2) != 0 || (ZV % 2) != 0 || (NH % 2) != 0) {
+        err = "verify: tp: the GDN v-heads, the value dim and the q heads must be even";
+        return false;
+    }
+    // The local conv history is [channels][3]; the local recurrent state is [row][v_head][col] with the LOCAL
+    // v-head count, so it is S*(HV/2)*S + 7168*3 floats per GDN layer.
+    const int64_t S = g.ssm_state_size;
+    gdn_state_tp_floats_ = S * HVt * S + Ct * (g.ssm_d_conv - 1);
+    uint64_t bytes = 0;
+    bytes += (uint64_t) nG * MT * Ct * 4 * 2;     // qkv_tp_ + h_tp_
+    bytes += (uint64_t) nG * MT * HVt * 4 * 2;    // gate_tp_ + beta_tp_
+    bytes += (uint64_t) MT * ZVt * 4 * 2;         // z_tp_ + y_tp_
+    bytes += (uint64_t) MT * ZV * 4;              // y_full_ (rank 0's full-width GDN value buffer)
+    bytes += (uint64_t) MT * (g.n_embd / 2) * 4;   // half_out_ (the out-projections' compact [T][N/2])
+    bytes += (uint64_t) nG * Ct * g.ssm_d_conv * 4;                // conv_w_tp_ (4 taps)
+    bytes += (uint64_t) nG * gdn_state_tp_floats_ * 4;             // gdn_state_tp_
+    void* arena = nullptr;
+    if (cudaMalloc(&arena, bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        err = "verify: tp: the local pipeline scratch could not be allocated (" + std::to_string(bytes >> 20) +
+              " MiB on this card)";
+        return false;
+    }
+    tp_arena_ = arena;
+    uint8_t* p = (uint8_t*) arena;
+    auto take = [&](uint64_t n, uint64_t esize) -> void* {
+        void* r = p;
+        p += (n * esize + 255) & ~255ull;
+        return r;
+    };
+    qkv_tp_ = (float*) take((uint64_t) nG * MT * Ct, 4);
+    h_tp_ = (float*) take((uint64_t) nG * MT * Ct, 4);
+    gate_tp_ = (float*) take((uint64_t) nG * MT * HVt, 4);
+    beta_tp_ = (float*) take((uint64_t) nG * MT * HVt, 4);
+    z_tp_ = (float*) take((uint64_t) MT * ZVt, 4);
+    y_tp_ = (float*) take((uint64_t) MT * ZVt, 4);
+    y_full_ = (float*) take((uint64_t) MT * ZV, 4);
+    half_out_ = (float*) take((uint64_t) MT * (g.n_embd / 2), 4);
+    conv_w_tp_ = (float*) take((uint64_t) nG * Ct * g.ssm_d_conv, 4);   // 4 taps per channel
+    gdn_state_tp_ = (float*) take((uint64_t) nG * gdn_state_tp_floats_, 4);
+    const cudaError_t z = cudaMemsetAsync(arena, 0, bytes, cs_);
+    if (z != cudaSuccess) {
+        err = std::string("verify: tp: the local scratch could not be zeroed: ") + cudaGetErrorString(z);
+        return false;
+    }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: tp: the local scratch's zeroing failed";
+        return false;
+    }
+    // This rank's 7168 of the 10240 conv channels per GDN layer (q/k are replicated, v is this card's half).
+    {
+        int64_t gi = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (is_qsa_layer(g, l)) continue;
+            const WeightRef* wc = need(LayerView(wt, l), "ssm_conv1d.weight", err);
+            if (wc == nullptr) return false;
+            strata::core::tp_local_conv_weights((const float*) wc->data, tp_rank_, conv_w_tp_ + (size_t) gi * Ct * 4,
+                                                cs_);
+            ++gi;
+        }
+        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+            err = "verify: tp: the local conv weights could not be extracted";
+            return false;
+        }
+        if (gi != nG) {
+            err = "verify: tp: the pack holds " + std::to_string(gi) + " GDN layers, the geometry " +
+                  std::to_string(nG);
+            return false;
+        }
+    }
+    // The experts' FFN split for this rank.  The layouts are per (gu_type, d_type) pair, so the pack's format
+    // is resolved here once and every layer must agree (one expert format per model).
+    {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        std::string why;
+        bool ok = lay.native;
+        for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+            const auto& f = lay.fmt[(size_t) l];
+            TpMoeSplit ms;
+            if (!tp_moe_split(f.gu_type, f.d_type, f.n_embd, f.n_ff, tp_rank_, ms, why)) {
+                ok = false;
+                break;
+            }
+            if (l == 0) tp_moe_ = ms;
+            // every layer's split must address the same blob geometry, or one layout cannot serve them all
+            else if (ms.ptr_off != tp_moe_.ptr_off || ms.layout.n_ff != tp_moe_.layout.n_ff ||
+                     ms.layout.gu_row != tp_moe_.layout.gu_row || ms.layout.d_row != tp_moe_.layout.d_row) {
+                ok = false;
+                why = "the layers' expert formats differ";
+            }
+        }
+        if (!ok) {
+            err = "verify: tp: the experts' FFN cannot be split across the two cards: " + why +
+                  " (a tensor-parallel window needs both cards on every layer's experts)";
+            return false;
+        }
+        tp_moe_scratch_ = nullptr;
+        const int64_t capx = (int64_t) MT * ss_->k;
+        // gate/up scratch (the local width) and the FULL-width hq the down reads, ONE each per group set
+        // (the two share of a layer must not clobber the first before the exchange); the compact down output
+        // is a single buffer - the two group sets' entries' dst rows are disjoint (an entry is in exactly one
+        // tier), so the second down cannot clobber the first's.
+        const size_t local_scratch = tp_moe_split_scratch_bytes(capx, tp_moe_);
+        // The down's scratch is a FULL-width buffer: the down phase reads its hq at `scratch + 3*fa` (fa from
+        // L.n_ff = the full width), so passing a full-width scratch puts that hq at hq_off(capx, n_ff_full) -
+        // exactly where moe_hq_exchange assembles the two ranks' halves.  The gate|up|h triple at the front of
+        // that buffer is unused by the down phase (its fa would differ), just padding.
+        const int64_t n_ff_full = tp_moe_.layout.n_ff * 2;
+        const size_t down_scratch = strata::kernels::native_expert_scratch_bytes(capx, n_ff_full);
+        if (cudaMalloc(&tp_moe_scratch_, local_scratch) != cudaSuccess ||
+            cudaMalloc(&tp_moe_scratch2_, local_scratch) != cudaSuccess ||
+            cudaMalloc(&tp_moe_hq_, down_scratch) != cudaSuccess ||
+            cudaMalloc(&tp_moe_hq2_, down_scratch) != cudaSuccess ||
+            cudaMalloc(&tp_moe_hitc_, (size_t) capx * (size_t) (g.n_embd / 2) * sizeof(float)) != cudaSuccess ||
+            cudaMalloc((void**) &tp_ptr_, (size_t) capx * sizeof(unsigned long long)) != cudaSuccess ||
+            cudaMalloc((void**) &tp_ptr2_, (size_t) capx * sizeof(unsigned long long)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            err = "verify: tp: the expert scratch could not be allocated";
+            return false;
+        }
+        tp_moe_ok_ = true;
+        // This rank's byte windows of every layer's blob (its half of gate, of up and of down, plus the NVFP4
+        // tail): the PCIe share's fetch copies only these, so each card's link carries half a blob instead of a
+        // whole one (fetch_blobs_spans).  The windows come from core::tp_blob_ranges - the SAME definition the
+        // prompt path's DMA uses, so the two moving paths and the kernels' own addressing cannot drift apart
+        // (that header's down window is `down_ptr_off + down.down_off`: the rank's down rows live in the LAYOUT,
+        // not in a pointer offset).  The layout is per layer (up_off/down_off/tail_off can differ), so every layer
+        // is resolved; if any window is not 16-byte aligned the fetch falls back to the whole blob (the alignment
+        // depends on the pack's row strides, which are format constants, so both ranks agree either way).
+        {
+            size_t windowed = 0;
+            bool ok = g.n_layers > 0, cover = ok;
+            tp_fetch_spans_.assign((size_t) g.n_layers, strata::kernels::FetchSpans{});
+            for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+                const int64_t blob = (int64_t) lay.blob_bytes(l);
+                const auto& f = lay.fmt[(size_t) l];
+                // BOTH ranks' windows: this rank's go into tp_fetch_spans_ (its fetch), the pair's union decides
+                // whether an ADMITTED blob (a cache slot both ranks later read) can be filled by both ranks at
+                // once - see tp_slot_cover_.  Windows always copy source -> the same offsets, so overlaps are
+                // harmless (both ranks read the same NVFP4 tail); only a HOLE would leave stale bytes in a slot.
+                core::TpBlobRange both[8];
+                int nb = 0;
+                for (int r = 0; r < 2 && ok; ++r) {
+                    TpMoeSplit ms;
+                    std::string why;
+                    core::TpBlobRange q[4];
+                    if (!tp_moe_split(f.gu_type, f.d_type, f.n_embd, f.n_ff, r, ms, why)) {
+                        ok = false;   // the geometry check above already passed: treat as "no windows", copy whole
+                        break;
+                    }
+                    const int nq = core::tp_blob_ranges_for_layer(lay, l, ms, q);
+                    if (nq <= 0) {
+                        ok = false;
+                        break;
+                    }
+                    for (int j = 0; j < nq; ++j) both[nb++] = q[j];
+                    if (r != tp_rank_) continue;
+                    strata::kernels::FetchSpans& s = tp_fetch_spans_[(size_t) l];
+                    s.nr = nq;
+                    for (int j = 0; j < nq; ++j) {
+                        s.off[j] = (int64_t) q[j].off;
+                        s.len[j] = (int64_t) q[j].bytes;
+                        if (s.off[j] < 0 || s.len[j] <= 0 || (s.off[j] & 15) != 0 || (s.len[j] & 15) != 0 ||
+                            s.off[j] + s.len[j] > blob) {
+                            ok = false;
+                            break;
+                        }
+                        windowed += (size_t) s.len[j];
+                    }
+                }
+                if (!ok) break;
+                for (int a = 1; a < nb; ++a) {   // insertion sort by offset (nb <= 8)
+                    const core::TpBlobRange t = both[a];
+                    int b = a - 1;
+                    while (b >= 0 && both[b].off > t.off) { both[b + 1] = both[b]; --b; }
+                    both[b + 1] = t;
+                }
+                int64_t reached = 0;
+                for (int a = 0; a < nb; ++a) {
+                    const int64_t o = (int64_t) both[a].off, e = o + (int64_t) both[a].bytes;
+                    if (o > reached) { cover = false; break; }   // a hole: the slot would keep stale bytes
+                    if (e > reached) reached = e;
+                }
+                if (reached != blob) cover = false;
+            }
+            tp_half_fetch_ = ok;
+            tp_slot_cover_ = ok && cover;
+            if (tp_slot_cover_) {   // measured slower (see the member's comment): opt-in only
+                const char* e = std::getenv("STRATA_TP_TWO_RANK_SLOT");
+                tp_two_rank_slot_ = e != nullptr && e[0] != '0';
+            }
+            if (tp_half_fetch_) {
+                std::fprintf(stderr, "strata verify: tp: rank %d fetches %zu of %zu blob bytes per expert over PCIe"
+                                     " (its half; the peer fetches the other half over its own link); the pair's"
+                                     " windows %s the blob, so %s\n",
+                             tp_rank_, windowed / (size_t) g.n_layers, (size_t) lay.blob_bytes(0),
+                             tp_slot_cover_ ? "tile" : "do NOT tile",
+                             tp_slot_cover_ ? (tp_two_rank_slot_ ? "an admitted cache slot is filled by both ranks"
+                                                                 : "rank 0 fills an admitted slot whole and this"
+                                                                   " rank skips it (STRATA_TP_TWO_RANK_SLOT=1"
+                                                                   " splits the fill, measured slower)")
+                                            : "an admitted cache slot is filled whole by rank 0");
+            }
+        }
+        // DIAG (STRATA_MOE_HQ_DUMP=1): pinned staging for the capture-safe layer-0 hq dump.  The in-graph D2H
+        // node (record_window_tp's dump_moe_hq_diag) fills the front with the ASSEMBLED set0 hq and the back
+        // with this rank's LOCAL set0 gate/up hq; run_tp writes both ranks' buffers to disk after the join.
+        // q8_1 block = 36 bytes (4B scale + 32B int8 codes); full hq = n_ff/32 blocks, local = n_ff/2/32.
+        // Layout in the staging (per rank): [set0 hq][set0 lq][set2 hq][set2 lq][hit_out (this rank's pitched
+        // MoE band, N floats per entry)].  hit_out is dumped AFTER both down_split calls (it holds the pitched
+        // band and the CPU share that follows writes parts_, not hit_out_).
+        const int64_t blocks_full = (int64_t) (tp_moe_.layout.n_ff * 2) / 32;   // full n_ff 640/32 = 20 blocks
+        const int64_t blocks_local = (int64_t) tp_moe_.n_ff_local / 32;         // local 320/32 = 10 blocks
+        moe_hq_diag_hq_bytes_ = (int64_t) capx * blocks_full * 36;             // per set hq: cap x 720 B
+        const int64_t lq_bytes = (int64_t) capx * blocks_local * 36;           // per set lq: cap x 360 B
+        moe_hq_dump_hq_sz_ = (size_t) moe_hq_diag_hq_bytes_;
+        moe_hq_dump_hitc_sz_ = (size_t) capx * (size_t) g.n_embd * sizeof(float);   // hit_out: capx x N f32
+        // 4 hq/lq regions (layer 0 only) + hit_out for EVERY layer (STRATA_MOE_HQ_DUMP=1: the per-layer MoE band,
+        // so the split's first diverging layer is found against the full-width mofull band).
+        const size_t total = 2 * (size_t) moe_hq_diag_hq_bytes_ + 2 * (size_t) lq_bytes +
+                             (size_t) g.n_layers * moe_hq_dump_hitc_sz_;
+        if (!mapped(total, (void**) &h_moe_hq_diag_, (void**) &m_moe_hq_diag_)) {
+            err = "verify: tp: the MoE-hq dump staging could not be mapped";
+            return false;
+        }
+    }
+    // STRATA_GDN_VALDUMP staging: PERSISTENT pinned host buffers for the per-rank GDN value vectors (y_full_ and
+    // y_tp_).  They must be allocated HERE, OUTSIDE the graph capture: a cudaHostAlloc is not a legal capture op, so
+    // allocating it inside record_window_tp (as an earlier attempt did) poisons the capture and the window dies at
+    // layer 0's allreduce with "operation failed due to a previous error during capture".  Allocated once for the
+    // max window (MT); each window's T <= MT, so the buffers are large enough.  The in-capture D2H and the window-end
+    // fwrite mirror the STRATA_MOE_HQ_DUMP / STRATA_TP_VEC pattern (pinned buffer, graph-node D2H, write outside).
+    if (std::getenv("STRATA_GDN_VALDUMP") != nullptr && tp_rank_ >= 0 && tp_rank_ < 2 &&
+        g_gdnval_full_h_[tp_rank_] == nullptr) {
+        if (cudaHostAlloc(&g_gdnval_full_h_[tp_rank_], (size_t) MT * (size_t) ZV * sizeof(float), 0) != cudaSuccess ||
+            cudaHostAlloc(&g_gdnval_half_h_[tp_rank_], (size_t) MT * (size_t) ZVt * sizeof(float), 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            g_gdnval_full_h_[tp_rank_] = nullptr;
+            g_gdnval_half_h_[tp_rank_] = nullptr;
+        }
+    }
+    std::fprintf(stderr,
+                 "strata verify: tp: rank %d local scratch %llu MiB (qkv/h %lld conv channels, gate/beta %lld heads, "
+                 "state %.1f MiB over %lld GDN layers, experts at n_ff %lld per card)\n",
+                 tp_rank_, (unsigned long long) (bytes >> 20), (long long) Ct, (long long) HVt,
+                 (double) ((uint64_t) nG * gdn_state_tp_floats_ * 4) / (1024.0 * 1024.0), (long long) nG,
+                 (long long) tp_moe_.n_ff_local);
+    (void) NHt;
+    return true;
+}
+
+uint8_t* Verifier::tp_moe_local_hq(int set) const {
+    // The peer's exchange adds the PER-WINDOW hq offset (hq_off(cap, n_ff_local), cap = the window's entry
+    // count) to this base itself, so the pointer handed over P2P must be the raw gate/up scratch BASE - the
+    // same `scratch` the local `exchange_hq` reads its own local hq from.
+    return (uint8_t*) (set ? tp_moe_scratch2_ : tp_moe_scratch_);
+}
+
+bool Verifier::tp_zero_persistent(std::string& err) {
+    if (!tp_on_) return true;
+    if (gdn_state_tp_ == nullptr) { err = "verify: tp_zero_persistent before tp_setup_scratch"; return false; }
+    const OnDevice on_self(device_);
+    const int64_t nG = g_->n_gdn_layers();
+    const uint64_t bytes = (uint64_t) nG * gdn_state_tp_floats_ * 4;
+    if (bytes == 0) return true;
+    const cudaError_t z = cudaMemsetAsync(gdn_state_tp_, 0, bytes, cs_);
+    if (z != cudaSuccess) { err = "verify: tp: zeroing the local GDN state failed: " + std::string(cudaGetErrorString(z)); return false; }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify: tp: the local GDN state's zeroing did not complete"; return false; }
+    return true;
+}
+
+bool Verifier::tp_setup_flags(std::string& err) {
+    if (!tp_on_) { err = "verify: tp_setup_flags on a verifier that is not a TP rank (set_tp)"; return false; }
+    if (tp_peer_ == nullptr || !tp_peer_->tp_on_) {
+        err = "verify: tp_setup_flags needs the peer verifier (set_tp_peer) with set_tp on it";
+        return false;
+    }
+    if (tp_flag_a_h_ != nullptr && tp_flag_b_h_ != nullptr) return true;   // said once
+    // The pair: rank 0's allreduce kernel reads and writes BOTH buffers, so the two cards must see each other
+    // (P2P over NVLink on this box).  open() is idempotent per device pair and reports a plain-PCIe fallback.
+    // Rank 1 opens the pair in the MIRRORED order (dev_a = rank 0's card, dev_b = its own): its fused handshake
+    // runs on dev_b (publish_wait) and the full-width GDN out-projection has it write its value half into rank 0's
+    // buffer (broadcast_to_a, also dev_b).  Both need P2P enabled on this card.
+    if (tp_rank_ == 0) {
+        if (!tp_ar_.open(device_, tp_peer_dev_, err)) return false;
+    } else if (!tp_ar_.open(tp_peer_dev_, device_, err)) {
+        return false;
+    }
+    // the host words are allocated once; each card resolves its own device view of them below
+    const OnDevice on_self(device_);
+    uint32_t* ha = nullptr;
+    uint32_t* hb = nullptr;
+    void* da = nullptr;
+    void* db = nullptr;
+    if (!mapped(64, (void**) &ha, &da) || !mapped(64, (void**) &hb, &db)) {
+        err = "verify: tp: the mapped handshake flags could not be allocated";
+        return false;
+    }
+    uint32_t* hc = nullptr;
+    void* dc = nullptr;
+    if (!mapped(64, (void**) &hc, &dc)) {
+        err = "verify: tp: the mapped MoE-broadcast flag could not be allocated";
+        return false;
+    }
+    uint32_t* hd = nullptr;
+    void* dd = nullptr;
+    uint32_t* he = nullptr;
+    void* de = nullptr;
+    uint32_t* hf = nullptr;
+    void* df = nullptr;
+    uint32_t* hg = nullptr;
+    void* dg = nullptr;
+    uint32_t* hh = nullptr;
+    void* dh = nullptr;
+    uint32_t* hi = nullptr;
+    void* di = nullptr;
+    uint32_t* hj = nullptr;
+    void* dj = nullptr;
+    if (!mapped(64, (void**) &hd, &dd) || !mapped(64, (void**) &he, &de) || !mapped(64, (void**) &hf, &df) ||
+        !mapped(64, (void**) &hg, &dg) || !mapped(64, (void**) &hh, &dh) || !mapped(64, (void**) &hi, &di) ||
+        !mapped(64, (void**) &hj, &dj)) {
+        err = "verify: tp: the mapped MoE-allreduce flags could not be allocated";
+        return false;
+    }
+    tp_flag_a_h_ = ha; tp_flag_a_d_ = (uint32_t*) da;
+    tp_flag_b_h_ = hb; tp_flag_b_d_ = (uint32_t*) db;
+    tp_flag_c_h_ = hc; tp_flag_c_d_ = (uint32_t*) dc;
+    tp_flag_d_h_ = hd; tp_flag_d_d_ = (uint32_t*) dd;
+    tp_flag_e_h_ = he; tp_flag_e_d_ = (uint32_t*) de;
+    tp_flag_f_h_ = hf; tp_flag_f_d_ = (uint32_t*) df;
+    tp_flag_g_h_ = hg; tp_flag_g_d_ = (uint32_t*) dg;
+    tp_flag_h_h_ = hh; tp_flag_h_d_ = (uint32_t*) dh;   // MoE hq exchange, rank 1 -> rank 0
+    tp_flag_j_h_ = hj; tp_flag_j_d_ = (uint32_t*) dj;   // MoE band stitch, rank 1 -> rank 0
+    tp_flag_i_h_ = hi; tp_flag_i_d_ = (uint32_t*) di;   // MoE hq exchange, rank 0 -> rank 1
+    // The device pointer is per-device: cudaHostGetDevicePointer resolves the host range in the CALLING
+    // device's UVA space, and a pointer resolved on one card is not valid on another.  The peer therefore
+    // resolves the same host words again with its own device current.
+    if (tp_peer_ != nullptr) {
+        const OnDevice on_peer(tp_peer_->device_);
+        void* pa = nullptr;
+        void* pb = nullptr;
+        if (cudaHostGetDevicePointer(&pa, ha, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer(&pb, hb, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            err = "verify: tp: CUDA" + std::to_string(tp_peer_->device_) + " could not map the handshake flags";
+            return false;
+        }
+        tp_peer_->tp_flag_a_h_ = ha;
+        tp_peer_->tp_flag_a_d_ = (uint32_t*) pa;
+        tp_peer_->tp_flag_b_h_ = hb;
+        tp_peer_->tp_flag_b_d_ = (uint32_t*) pb;
+        // the MoE-broadcast flag, mapped into the peer's UVA space the same way
+        void* pc = nullptr;
+        if (cudaHostGetDevicePointer(&pc, hc, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            err = "verify: tp: CUDA" + std::to_string(tp_peer_->device_) + " could not map the broadcast flag";
+            return false;
+        }
+        tp_peer_->tp_flag_c_h_ = hc;
+        tp_peer_->tp_flag_c_d_ = (uint32_t*) pc;
+        // the MoE combine's allreduce pair, mapped the same way
+        void* pd = nullptr;
+        void* pe = nullptr;
+        if (cudaHostGetDevicePointer(&pd, hd, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer(&pe, he, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            err = "verify: tp: CUDA" + std::to_string(tp_peer_->device_) + " could not map the MoE-allreduce flags";
+            return false;
+        }
+        tp_peer_->tp_flag_d_h_ = hd;
+        tp_peer_->tp_flag_d_d_ = (uint32_t*) pd;
+        tp_peer_->tp_flag_e_h_ = he;
+        tp_peer_->tp_flag_e_d_ = (uint32_t*) pe;
+        void* pf = nullptr;
+        if (cudaHostGetDevicePointer(&pf, hf, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            err = "verify: tp: CUDA" + std::to_string(tp_peer_->device_) + " could not map the staging flag";
+            return false;
+        }
+        tp_peer_->tp_flag_f_h_ = hf;
+        tp_peer_->tp_flag_f_d_ = (uint32_t*) pf;
+        void* pg = nullptr;
+        if (cudaHostGetDevicePointer(&pg, hg, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            err = "verify: tp: CUDA" + std::to_string(tp_peer_->device_) + " could not map the GDN flag";
+            return false;
+        }
+        tp_peer_->tp_flag_g_h_ = hg;
+        tp_peer_->tp_flag_g_d_ = (uint32_t*) pg;
+        void* ph = nullptr;
+        void* pi = nullptr;
+        if (cudaHostGetDevicePointer(&ph, hh, 0) != cudaSuccess || cudaHostGetDevicePointer(&pi, hi, 0) !=
+            cudaSuccess) {
+            (void) cudaGetLastError();
+            err = "verify: tp: CUDA" + std::to_string(tp_peer_->device_) + " could not map the MoE-exchange flags";
+            return false;
+        }
+        tp_peer_->tp_flag_h_h_ = hh;
+        tp_peer_->tp_flag_h_d_ = (uint32_t*) ph;
+        tp_peer_->tp_flag_i_h_ = hi;
+        tp_peer_->tp_flag_i_d_ = (uint32_t*) pi;
+        void* pj = nullptr;
+        if (cudaHostGetDevicePointer(&pj, hj, 0) != cudaSuccess) {
+            (void) cudaGetLastError();
+            err = "verify: tp: CUDA" + std::to_string(tp_peer_->device_) + " could not map the stitch flag";
+            return false;
+        }
+        tp_peer_->tp_flag_j_h_ = hj;
+        tp_peer_->tp_flag_j_d_ = (uint32_t*) pj;
+    }
+    std::fprintf(stderr, "strata verify: tp: rank %d on CUDA%d (peer CUDA%d), handshake flags in mapped host memory\n",
+                 tp_rank_, device_, tp_peer_dev_);
+    return true;
+}
+
+bool Verifier::capture_tp(int T, std::string& err) {
+    if (T < 1 || T > max_t_) { err = "verify: tp window size out of range"; return false; }
+    if (tp_exec_[T] != nullptr) return true;   // captured once per window size
+    const OnDevice on_self(device_);   // the coordinator may call this on the peer's verifier
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = "verify: tp: begin window capture failed";
+        return false;
+    }
+    bool ok = true;
+    try {
+        ok = record_window_tp(T, cs_, err);
+    } catch (const std::exception& e) {
+        ok = false;
+        err = std::string("verify: tp window: ") + e.what();
+    }
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    if (!ok) {
+        if (graph != nullptr) cudaGraphDestroy(graph);
+        return false;
+    }
+    if (ce != cudaSuccess) {
+        err = "verify: tp: end window capture: " + std::string(cudaGetErrorString(ce));
+        return false;
+    }
+    const bool made = instantiate_evicting(tp_exec_[T], graph, {}, "verify: tp: instantiate: ", err);
+    cudaGraphDestroy(graph);
+    if (!made) return false;
+    const cudaError_t ue = cudaGraphUpload(tp_exec_[T], cs_);
+    const cudaError_t us = cudaStreamSynchronize(cs_);
+    std::fprintf(stderr, "strata verify: tp: captured the %d-token window on rank %d (upload %s, sync %s)\n", T,
+                 tp_rank_, cudaGetErrorString(ue), cudaGetErrorString(us));
+    return true;
+}
+
+// ===================================== the TP window =====================================
+// The default decode path of record_window with the dense GDN and QSA work split across the two cards, a
+// per-layer allreduce of the row-parallel out-projection's partial sums, and the experts' FFN cut in two.
+//
+//   * the hyper-connection reads/writes, the router, the shared expert and the head all read the FULL residual
+//     (both cards hold it after the allreduce), so they run unchanged on both cards.
+//   * the GDN mixer splits its v-heads in two.  q/k are replicated inside the conv (head pairing is h % h_k), so
+//     each card's conv output is 7168 channels and its `ssm_out` holds the 3072 columns of its own v half.
+//   * the QSA mixer replicates the query/key/value projections and the attention itself (the attention kernel's
+//     KV-head group is a compile-time constant), and splits `attn_output`'s reduction axis over q-head halves.
+//   * the experts' FFN is split by intermediate width (tp_moe_split.hpp): each card runs gate/up rows and down
+//     columns [rank*n_ff/2, (rank+1)*n_ff/2) of every routed expert, and the two partial residuals are summed.
+//
+// Per layer the two cards hand off through mapped flags (tp_flag_a_/b_ for the out-projection's allreduce,
+// d_/e_ for the combine's, f_ for the PCIe staging), captured INSIDE the graphs as spin-wait kernels - a CUDA
+// graph is single-device, so no event can order them:
+//
+//   rank 0:  ... out-proj partial -> wait(b, l+1) -> allreduce(bo_, peer) -> raise(a, l+1) -> ... experts ->
+//            wait(d, l+1) -> allreduce(bo_, peer) -> raise(e, l+1)
+//   rank 1:  ... out-proj partial -> raise(b, l+1) -> wait(a, l+1) -> ... experts -> raise(d, l+1) -> wait(e, l+1)
+//
+// NOTE on the residual write: like the ordinary window, a non-final layer does NOT write the residual streams
+// in `post`.  Its FFN write is folded into the NEXT layer's hyper-connection read (`gr_read_group`'s `apply`).
+// Writing it here as well applied it twice - the single card's layer 0 `bo_` matched to 1e-8 while layer 1's
+// residual was 3% off.
+bool Verifier::record_window_tp(int T, cudaStream_t cs, std::string& err) {
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    const WeightTable& wt = *wt_;
+    SessionState& ss = *ss_;
+    const int64_t N = g.n_embd, HC = g.hc, K = ss.k, ZV = g.ssm_value_dim;
+    const int64_t HV = g.ssm_v_heads, HK = g.ssm_k_heads, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
+    const int64_t IQ = g.idx_q_heads, ID = g.idx_key_dim, NE = g.n_expert, MT = max_t_;
+    const QsaShapes sh = shapes_of(g);
+    const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
+    const int64_t S = g.ssm_state_size;
+    const int64_t Ct = strata::core::kTpGdnConvChannels;   // 7168 local conv channels
+    const int64_t HVt = HV / 2;                            // 24 local v-heads
+    const int64_t ZVt = ZV / 2;                            // 3072 local value dim
+    const int head_off = (int) (tp_rank_ * HVt);           // this rank's first global v-head
+    const int64_t TS = (sh.idx_block - 1) * ID;
+    const bool ple_on = ss.ple.ready() && ple_stage();
+    auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
+    const int G = 1;   // one group: a TP window is never split (the two cards are the parallelism)
+    const int te = T;
+    const bool self_commit = false;   // the commit graph advances the state; a TP window never writes it
+    static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool fuse_head_gr = [] {
+        const char* e = std::getenv("STRATA_FUSE_HEAD_GR");
+        return e && e[0] == '1';
+    }() && (le_ == g.n_layers) && (head_ != nullptr && head_->loaded()) && !cvec().covers(g.n_layers - 1);
+    auto stamp = [&](int64_t l, int i) {
+        if (prof_on_) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
+        if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2), cs);
+    };
+    if (qkv_tp_ == nullptr || conv_w_tp_ == nullptr || gdn_state_tp_ == nullptr) {
+        err = "verify: tp: record_window_tp before tp_setup_scratch";
+        return false;
+    }
+    if (tp_flag_a_d_ == nullptr || tp_flag_b_d_ == nullptr) {
+        err = "verify: tp: record_window_tp before tp_setup_flags";
+        return false;
+    }
+    if (tp_rank_ == 0 && tp_bo_peer_ == nullptr) {
+        // the coordinator needs the peer's bo_ as a P2P pointer: set_tp_bo_peer(peer->tp_bo()) exposed it
+        err = "verify: tp: rank 0 has no peer bo_ buffer (set_tp_bo_peer) - the allreduce has nowhere to write";
+        return false;
+    }
+
+    // ---- the window's inputs
+    copy_i32_from_mapped(tok_, m_tok_, T, cs);
+    copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
+    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), cs);
+    const int32_t* pos_k = pos_ + MT * NH;
+    const int32_t* pos_i = pos_ + MT * (NH + NKV);
+
+    // ---- the embeddings (replicated: every card holds the full table)
+    if (const NativeEmbed* ne = native_embed()) {
+        ne->gather_dev(tok_, T, emb_, cs);
+        broadcast_streams(emb_, R_, N, (int) HC, T, cs);
+    } else {
+        const WeightRef* w = wt.find("token_embd.weight");
+        if (w == nullptr || w->codebook_iq4nl || (w->code_bits != 2 && w->code_bits != 4 && w->code_bits != 8)) {
+            err = "verify: token_embd.weight is missing or not an S2/S4/S8 tensor";
+            return false;
+        }
+        const auto* codes = (const uint8_t*) w->data;
+        const auto* scales = (const float*) (codes + w->codes_bytes);
+        const auto* offsets = w->has_offset ? (const float*) (codes + w->codes_bytes + w->scales_bytes) : nullptr;
+        const uint64_t row_codes = (uint64_t) (w->ne0 / (8 / w->code_bits));
+        const uint64_t row_groups = (uint64_t) (w->ne0 / w->group_elems);
+        embedding_gather_dev(codes, scales, offsets, tok_, T, w->ne0, w->code_bits, w->code_bias, w->group_elems,
+                             row_codes, row_groups, emb_, cs);
+        broadcast_streams(emb_, R_, N, (int) HC, T, cs);
+    }
+
+    // per-layer state indices (GDN and QSA layers are numbered separately)
+    std::vector<int64_t> gdn_idx((size_t) g.n_layers, -1), qsa_idx((size_t) g.n_layers, -1);
+    {
+        int64_t qi = 0, gi = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (is_qsa_layer(g, l)) qsa_idx[(size_t) l] = qi++;
+            else gdn_idx[(size_t) l] = gi++;
+        }
+    }
+
+    // ---------------------------------------------------------------- pre(l): up to the ring
+    // STRATA_TP_FUSED=0: the earlier three-launch handshake form, kept for A/B against the fused one
+    static const bool tp_fused = [] {
+        const char* v = std::getenv("STRATA_TP_FUSED");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    // STRATA_TP_ATTN_FULL=1 (EXPERIMENTAL, default off): rank 0 computes the whole attention out-projection.
+    // It is bit-exact but gives up the parallel gain, and on its own it did not make the tokens match.
+    static const bool attn_full = [] {
+        const char* v = std::getenv("STRATA_TP_ATTN_FULL");
+        return v != nullptr && std::atoi(v) != 0;   // opt-in: full-width out-projection (bit-exact, no parallel gain)
+    }();
+    // STRATA_TP_GDN_FULL=1 (EXPERIMENTAL, default off): rank 0 computes the whole GDN out-projection from
+    // both cards' value halves.  NOT CORRECT YET: enabling it produced wrong tokens at 7.3 tok/s (the P2P
+    // hand-off between the two value halves is not ordered correctly), so the row-parallel split stays default.
+    static const bool gdn_full = [] {
+        const char* v = std::getenv("STRATA_TP_GDN_FULL");
+        return v != nullptr && std::atoi(v) != 0;   // opt-in: the full-width GDN path is not bit-exact yet
+    }();
+    auto pre = [&](int64_t l) -> bool {
+        stamp(l, 0);
+        const LayerView v(wt, l);
+        const char* pfx[2] = {"hc_attn_", "hc_ffn_"};
+        const WeightRef *wn[2], *wd[2], *wu[2], *wi[2];
+        for (int h = 0; h < 2; ++h) {
+            wn[h] = need(v, (std::string(pfx[h]) + "norm.weight").c_str(), err);
+            wd[h] = need(v, (std::string(pfx[h]) + "down.weight").c_str(), err);
+            wu[h] = need(v, (std::string(pfx[h]) + "up.weight").c_str(), err);
+            wi[h] = need(v, (std::string(pfx[h]) + "inject.weight").c_str(), err);
+            if (!wn[h] || !wd[h] || !wu[h] || !wi[h]) return false;
+        }
+        bool pending = l > 0 && !cvec().covers(l - 1);
+        // the PLE stage on layer 1 (replicated: the table and the history are the same on both cards)
+        if (l == 1 && ple_on) {
+            if (ar_on()) wait_flag_ge(m_flag_, 1, cs);
+            copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
+            float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
+            PleWeights pw = ss.ple.w;
+            // The residual write, in the ordinary window's batch form: the fused `native_gr_post_multi` reduces
+            // the hyper-connection's streams in its own order, so it is not bitwise the per-token gr_write.
+            const bool multi_write = dec_batch && !g_no_multi_gr && T > 1;
+            if (multi_write) gr_write_multi(Rt(0), bo_, inj2_, gs, Rt(0), (int) T, cs);
+            for (int t = 0; t < te; ++t) {
+                if (!multi_write) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+                PleOut po;
+                po.normalized = normalized;
+                po.result = Rt(t);
+                float* hist = ss.ple.hist;
+                try {
+                    ple_block(ple_ + t * N, Rt(t), hist, pw, po, ss.ple.scratch, cs);
+                    ple_history_advance(hist, normalized, cs);
+                } catch (const std::exception& e) {
+                    err = "verify: tp PLE: " + std::string(e.what());
+                    return false;
+                }
+                copy_from_mapped(hist_snap_ + (size_t) t * (int64_t) NG_HIST * NG_HC_DIM, hist,
+                                 (int64_t) NG_HIST * NG_HC_DIM, cs);
+            }
+            pending = false;
+        }
+        auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
+            FusedGrArgs fa[kFusedGrMaxT];
+            for (int t = 0; t < T; ++t) {
+                FusedGrArgs& a = fa[t];
+                a.R = Rt(t); a.R_out = Rt(t); a.apply = apply;
+                a.bo_prev = bo_ + t * N; a.inj_prev = inj_prev + t * HC;
+                a.w_norm = (const float*) wn[half]->data; a.w_down = (const uint16_t*) wd[half]->data;
+                a.w_up = (const uint16_t*) wu[half]->data; a.w_inject = (const uint16_t*) wi[half]->data;
+                a.q8_down = (const uint8_t*) wd[half]->hc_q8; a.q8_up = (const uint8_t*) wu[half]->hc_q8;
+                a.q8_inject = (const uint8_t*) wi[half]->hc_q8;
+                a.s_down = wd[half]->q8_scale; a.s_up = wu[half]->q8_scale;
+                a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
+                a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
+                if (qcnt_ != nullptr) {
+                    a.q8_cnt = qcnt_;
+                    if (half == 0) a.q8_mixed = xq_ + (size_t) t * (N / 32) * 36;
+                    else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
+                }
+            }
+            if (strata::kernels::fused_gr_read_persist(fa, T, cs)) return false;
+            return fused_gr_read_multi(fa, T, xn_, cs, (prof_on_) ? prof_ : nullptr,
+                                       (int) (l * kProfPer + (half == 0 ? 27 : 30)));
+        };
+        const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);
+        stamp(l, 1);
+        float* xm = mixed_;
+        if (m_tpdump_ != nullptr && l == 1)   // DIAG: this rank's mixer output (the MoE's input)
+            cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 96), xm, 4 * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
+        bool il_ready = false;
+        auto quant_in = [&](const float* x, int n_in) {
+#if !defined(STRATA_USE_HIP)
+            static const int qil_env = [] { const char* v = std::getenv("STRATA_QIL"); return v != nullptr ? std::atoi(v) : -1; }();
+            const bool qil = qil_env >= 0 ? qil_env != 0 : device_is_sm75();
+            if (qil && T >= 2 && T <= 4 && g_mmvq_il()) {
+                strata::kernels::native_quantize_q8_1_il(x, xq_, xil_, n_in, T, cs);
+                il_ready = true;
+                return;
+            }
+#endif
+            native_quantize_q8_1(x, xq_, n_in, T, cs);
+            il_ready = false;
+        };
+        auto mm = [&](const WeightRef* w, float* out, int n_in, int n_out) {
+            if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, T, n_out)) {
+                if (!il_ready && T >= 2) {
+                    strata::kernels::native_q8_1_interleave(xq_, xil_, n_in, T, cs);
+                    il_ready = true;
+                }
+                strata::kernels::native_mmvq_il(w->native_type, w->native_data, xq_, xil_, out, n_in, n_out, T, cs);
+            } else {
+                native_mmvq(w->native_type, w->native_data, xq_, out, n_in, n_out, T, cs);
+            }
+        };
+        // ---- the row-parallel out-projection's partial, then the per-layer handshake and allreduce
+        auto ring = [&](int64_t l) -> bool {
+            const uint32_t want = (uint32_t) (l + 1);   // global layer index + 1
+            std::string aerr;
+            if (!tp_fused) {
+                if (tp_rank_ == 0) {
+                    wait_flag_ge(tp_flag_b_d_, want, cs);
+                    if (!tp_ar_.allreduce(bo_, tp_bo_peer_, (int64_t) T * N, cs, nullptr, aerr)) {
+                        err = "verify: tp allreduce at layer " + std::to_string(l) + ": " + aerr;
+                        return false;
+                    }
+                    tp_raise_flag(tp_flag_a_d_, want, cs);
+                } else {
+                    tp_raise_flag(tp_flag_b_d_, want, cs);
+                    wait_flag_ge(tp_flag_a_d_, want, cs);
+                }
+                return true;
+            }
+            if (tp_rank_ == 0) {
+                // wait for the peer's partial, sum both buffers, then tell the peer (one launch, P1)
+                if (!tp_ar_.allreduce_wait_raise(bo_, tp_bo_peer_, (int64_t) T * N, cs, tp_flag_b_d_, want,
+                                                 tp_flag_a_d_, want, aerr)) {
+                    err = "verify: tp allreduce at layer " + std::to_string(l) + ": " + aerr;
+                    return false;
+                }
+            } else {
+                // publish this card's partial, then wait for the sum to land in bo_ over P2P (one launch, P1)
+                if (!tp_ar_.publish_wait(tp_flag_b_d_, want, tp_flag_a_d_, want, cs, aerr)) {
+                    err = "verify: tp publish at layer " + std::to_string(l) + ": " + aerr;
+                    return false;
+                }
+            }
+            return true;
+        };
+        try {
+            if (!is_qsa_layer(g, l)) {
+                // ======================= GDN (split: HV/2 v-heads per card) =======================
+                const WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
+                                *wout = need(v, "ssm_out.weight", err), *wa = need(v, "ssm_alpha.weight", err),
+                                *wb = need(v, "ssm_beta.weight", err), *wc = need(v, "ssm_conv1d.weight", err),
+                                *wnm = need(v, "ssm_norm.weight", err), *wdt = need(v, "ssm_dt.bias", err),
+                                *wsa = need(v, "ssm_a", err);
+                if (!wqkv || !wg || !wout || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
+                if (!native_of(wqkv, v.name("attn_qkv.weight"), err) || !native_of(wg, v.name("attn_gate.weight"), err) ||
+                    !native_of(wout, v.name("ssm_out.weight"), err))
+                    return false;
+                const int64_t gi = gdn_idx[(size_t) l];
+                float* state = gdn_state_tp_ + (size_t) gi * gdn_state_tp_floats_;
+                float* conv = state + (size_t) S * HVt * S;
+                float* cwt = conv_w_tp_ + (size_t) gi * Ct * g.ssm_d_conv;   // 4 taps
+                float* qkv = qkv_tp_ + (size_t) gi * MT * Ct;
+                float* hb = h_tp_ + (size_t) gi * MT * Ct;
+                float* gate = gate_tp_ + (size_t) gi * MT * HVt;
+                float* beta = beta_tp_ + (size_t) gi * MT * HVt;
+                if (!q8_attn) quant_in(xm, (int) N);
+                // qkv: the local 7168 of 10240 rows (q 2048 + k 2048 + this card's v 3072)
+                mm(wqkv, qkv, (int) N, (int) Ct);
+                stamp(l, 2);
+                if (m_tpdump_ != nullptr && l == 0) {   // DIAG: the GDN qkv rows and the conv output, vs the solo path
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 548), qkv, 4 * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 552), qkv + 2048, 4 * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 556), qkv + 4096, 4 * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
+                }
+                gdn_conv_l2_multi(conv, qkv, cwt, hb, (int) Ct, (int) (2 * HK), EPS, T, cs, 0, self_commit);
+                stamp(l, 3);
+                if (m_tpdump_ != nullptr && l == 0)   // DIAG: the conv/L2 output (q and k rows, then this card's v)
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 560), hb, 4 * sizeof(float),
+                                    cudaMemcpyDeviceToHost, cs);
+                // the gates over this card's HV/2 v-heads (the global head's weights/dt/ssm_a)
+                gdn_ab_multi_tp(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                (const float*) wsa->data, gate, beta, (int) N, (int) HVt, T, cs, head_off);
+                stamp(l, 4);
+                mm(wg, z_tp_, (int) N, (int) ZVt);
+                stamp(l, 5);
+                gdn_step_norm_multi_tp(state, hb, (int) Ct, gate, beta, z_tp_, (const float*) wnm->data, EPS, y_tp_,
+                                       (int) HK, (int) HVt, T, nullptr, cs, 0, nullptr, head_off);
+                stamp(l, 6);
+                if (gdn_full) {
+                    // rank 0 computes the WHOLE GDN out-projection: its own value heads in y_full_[0..ZVt),
+                    // rank 1's half copied over P2P into y_full_[ZVt..ZV).  Rank 0's out-projection is then
+                    // bit-exact with the single-card path; rank 1 contributes zero to the allreduce.
+                    // PITCH: y_tp_ is [T][ZVt], y_full_ is [T][ZV]: per token, as in the column-parallel branch.
+                    if (tp_rank_ == 0) {
+                        for (int t = 0; t < T; ++t)
+                            if (cudaMemcpyAsync(y_full_ + (size_t) t * ZV, y_tp_ + (size_t) t * ZVt,
+                                                (size_t) ZVt * sizeof(float), cudaMemcpyDeviceToDevice,
+                                                cs) != cudaSuccess) {
+                                err = "verify: tp: the GDN value copy failed";
+                                return false;
+                            }
+                        // rank 1's half must be in y_full_[ZVt..ZV) before the projection reads it
+                        wait_flag_ge(tp_flag_g_d_, (uint32_t) (l + 1), cs);
+                        native_quantize_q8_1(y_full_, xq_, (int) ZV, T, cs);
+                        il_ready = false;
+                        mm(wout, bo_, (int) ZV, (int) N);
+                        // ONE flag per direction (see the column-parallel branch): rank 1 spins on c
+                        tp_raise_flag(tp_flag_c_d_, (uint32_t) (l + 1), cs);
+                    } else {
+                        std::string aerr;
+                        // rank 1's half into RANK 0's y_full_[ZVt..ZV) (the P2P pointer set at setup), then tell
+                        // rank 0 it is there.  Rank 1 contributes zero to the allreduce here, so its own
+                        // y_full_ is never read and needs no local copy.
+                        for (int t = 0; t < T; ++t)
+                            if (!tp_ar_.broadcast_to_a(y_tp_ + (size_t) t * ZVt, y_peer_ + (size_t) t * ZV + ZVt,
+                                                       (int64_t) ZVt, cs, aerr)) {
+                                err = "verify: tp GDN half at layer " + std::to_string(l) + ": " + aerr;
+                                return false;
+                            }
+                        tp_raise_flag(tp_flag_g_d_, (uint32_t) (l + 1), cs);
+                        cudaMemsetAsync(bo_, 0, (size_t) T * N * sizeof(float), cs);
+                    }
+                } else {
+                    // COLUMN-parallel out-projection: each card holds half the OUTPUT ROWS and reduces the
+                    // FULL ZV value vector, so every output element is bit-identical with the single card's
+                    // (tests/core/tp_outproj_split_test.cu asserts exactly this on the real kernels).  The old
+                    // row-parallel split summed half the reduction per card and let the allreduce add the two
+                    // partials, which is not the single card's sum in float32.
+                    //
+                    // The full ZV vector needs the peer's value half, and the exchange is TWO-WAY: rank 1 sends
+                    // its half up (rank 0's [ZVt, ZV)) and rank 0 sends its half down (rank 1's [0, ZVt)).
+                    //
+                    // ONE flag per direction, never one shared flag with two counting sequences.  raise_flag is
+                    // a plain store (`*flag = value`), so two writers on one word overwrite each other: rank 0
+                    // would publish l+1+n_layers while rank 1 published l+1, and whichever landed second ROLLED
+                    // THE COUNTER BACK, leaving the other rank waiting on a value that never came (observed as
+                    // "tp stall at layer 1: seq=1 want=2").  rank 1 -> rank 0 uses g, rank 0 -> rank 1 uses c.
+                    //
+                    // PITCH: y_tp_ is [T][ZVt] and y_full_ is [T][ZV].  A single flat copy of T*ZVt floats would
+                    // put token t's half at t*ZVt instead of t*ZV, so token 0 alone would look right and every
+                    // later token in the window would read its neighbour's values.  Both transfers are per token.
+                    std::string aerr;
+                    if (tp_rank_ == 0) {
+                        for (int t = 0; t < T; ++t) {
+                            if (cudaMemcpyAsync(y_full_ + (size_t) t * ZV, y_tp_ + (size_t) t * ZVt,
+                                                (size_t) ZVt * sizeof(float), cudaMemcpyDeviceToDevice,
+                                                cs) != cudaSuccess) {
+                                err = "verify: tp: the GDN value copy failed";
+                                return false;
+                            }
+                        }
+                        wait_flag_ge(tp_flag_g_d_, (uint32_t) (l + 1), cs);   // rank 1's half is in y_full_[ZVt, ZV)
+                        // rank 0's half into RANK 1's y_full_[0, ZVt); rank 1 spins on flag c
+                        for (int t = 0; t < T; ++t)
+                            if (!tp_ar_.broadcast(y_tp_ + (size_t) t * ZVt, y_peer_ + (size_t) t * ZV,
+                                                  (int64_t) ZVt, cs, aerr)) {
+                                err = "verify: tp GDN half at layer " + std::to_string(l) + ": " + aerr;
+                                return false;
+                            }
+                        tp_raise_flag(tp_flag_c_d_, (uint32_t) (l + 1), cs);
+                        quant_in(y_full_, (int) ZV);
+                        // COLUMN-parallel output: the kernel writes a COMPACT [T][N/2] (y[j*n_out + row]), so
+                        // it goes to the scratch and each token is pitched into bo_'s [T][N] layout below.
+                        mm(wout, half_out_, (int) ZV, (int) (N / 2));
+                        for (int t = 0; t < T; ++t) {
+                            cudaMemcpyAsync(bo_ + (size_t) t * N, half_out_ + (size_t) t * (N / 2),
+                                            (size_t) (N / 2) * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+                            cudaMemsetAsync(bo_ + (size_t) t * N + N / 2, 0,
+                                            (size_t) (N / 2) * sizeof(float), cs);
+                        }
+                    } else {
+                        // rank 1's half into RANK 0's y_full_[ZVt, ZV) (the P2P pointer set at setup)
+                        for (int t = 0; t < T; ++t)
+                            if (!tp_ar_.broadcast_to_a(y_tp_ + (size_t) t * ZVt, y_peer_ + (size_t) t * ZV + ZVt,
+                                                       (int64_t) ZVt, cs, aerr)) {
+                                err = "verify: tp GDN half at layer " + std::to_string(l) + ": " + aerr;
+                                return false;
+                            }
+                        // ...AND into our OWN y_full_[ZVt, ZV): the exchange fills rank 0's second half from
+                        // here and OUR first half from rank 0, but nobody else can write our second half.
+                        // Without this the quantizer below reads last layer's stale values for our own 3072
+                        // v channels, so our 1280 output rows are wrong and the allreduce's sum is wrong in
+                        // every element (observed: l0 mixer output differing on 2560/2560, first token 420).
+                        for (int t = 0; t < T; ++t)
+                            if (cudaMemcpyAsync(y_full_ + (size_t) t * ZV + ZVt, y_tp_ + (size_t) t * ZVt,
+                                                (size_t) ZVt * sizeof(float), cudaMemcpyDeviceToDevice,
+                                                cs) != cudaSuccess) {
+                                err = "verify: tp: the GDN value copy failed";
+                                return false;
+                            }
+                        tp_raise_flag(tp_flag_g_d_, (uint32_t) (l + 1), cs);
+                        // rank 0's half arrives in OUR y_full_[0, ZVt) over P2P
+                        wait_flag_ge(tp_flag_c_d_, (uint32_t) (l + 1), cs);
+                        quant_in(y_full_, (int) ZV);
+                        mm(wout, half_out_, (int) ZV, (int) (N / 2));
+                        for (int t = 0; t < T; ++t) {
+                            cudaMemsetAsync(bo_ + (size_t) t * N, 0, (size_t) (N / 2) * sizeof(float), cs);
+                            cudaMemcpyAsync(bo_ + (size_t) t * N + N / 2, half_out_ + (size_t) t * (N / 2),
+                                            (size_t) (N / 2) * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+                        }
+                    }
+                }
+                stamp(l, 7);
+                // DIAG (STRATA_GDN_VALDUMP=1): the GDN VALUE VECTORS, per rank, at layer 0 (first window).  The
+                // column-parallel out-projection is bit-exact ONLY if the assembled full y_full_ is byte-identical
+                // on both ranks; that requires the two P2P copies to land clean:
+                //   y_full_[0,ZVt)    = rank0's local value half   (rank1's via tp_ar_.broadcast,     rank0 -> rank1)
+                //   y_full_[ZVt,ZV)   = rank1's local value half   (rank0's via tp_ar_.broadcast_to_a, rank1 -> rank0)
+                // so rank0.y_full_ and rank1.y_full_ must match byte-for-byte:
+                //   [0,ZVt)  byte-equal  => the rank0->rank1 broadcast is a clean copy
+                //   [ZVt,ZV) byte-equal  => the rank1->rank0 broadcast_to_a is a clean copy AND rank1's local
+                //                           gdn_step_norm_multi_tp(head_off=HVt) half equals rank0's.
+                // rank1's own y_tp_ (its local half) is dumped too, to tell "local half wrong" from "P2P copy wrong".
+                // STRATA_GDN_VALDUMP: the GDN value vectors, per rank, at layer 0 (first window).  y_full_/y_tp_ are
+                // DEVICE pointers (the take() arena is cudaMalloc'd), and this runs INSIDE the graph capture, so the
+                // only legal move is to RECORD a cudaMemcpyAsync (device->host) into the PERSISTENT pinned staging
+                // allocated in tp_setup_scratch (a cudaHostAlloc is NOT a legal capture op - it aborts the capture
+                // and poisons the stream).  The graph replays those copies and run_tp's window-end writer (outside
+                // capture) then fwrites the landed buffers - the exact STRATA_MOE_HQ_DUMP / STRATA_TP_VEC pattern.
+                if (std::getenv("STRATA_GDN_VALDUMP") != nullptr && l == 0 && tp_rank_ >= 0 && tp_rank_ < 2) {
+                    static bool done_[2] = {false, false};
+                    if (!done_[tp_rank_] && g_gdnval_full_h_[tp_rank_] != nullptr && g_gdnval_half_h_[tp_rank_] != nullptr) {
+                        g_gdnval_T_ = T; g_gdnval_ZV_ = (int) ZV; g_gdnval_ZVt_ = (int) ZVt;
+                        for (int t = 0; t < T; ++t) {
+                            cudaMemcpyAsync(g_gdnval_full_h_[tp_rank_] + (size_t) t * ZV, y_full_ + (size_t) t * ZV,
+                                            (size_t) ZV * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                            cudaMemcpyAsync(g_gdnval_half_h_[tp_rank_] + (size_t) t * ZVt, y_tp_ + (size_t) t * ZVt,
+                                            (size_t) ZVt * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                        }
+                        g_gdnval_fired_[tp_rank_] = 1;
+                    }
+                    done_[tp_rank_] = true;
+                }
+                // DIAG (STRATA_MOE_DN_D=1): the attention's output, per rank, AFTER the column-split out-projection
+                // allreduce (full width on both ranks).  The L0 site1 delta = this + the MoE delta + shared, so the
+                // [1280,2560) band's 1e-8 is split attention-vs-MoE by whether this dump differs there.
+                if (std::getenv("STRATA_MOE_DN_D") != nullptr && l == 0) {
+                    static bool done = false;
+                    if (!done) {
+                        const char* fn = std::getenv("STRATA_MOE_DN_D_FILE");
+                        if (fn != nullptr) {
+                            const std::string path = std::string(fn) + ".rank" + std::to_string(tp_rank_);
+                            if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                                for (int t = 0; t < 2; ++t)
+                                    std::fwrite(bo_ + (size_t) t * N, sizeof(float), (size_t) N, f);
+                                std::fclose(f);
+                            }
+                            done = true;
+                        }
+                    }
+                }
+                if (!ring(l)) return false;
+            } else {
+                // ======================= QSA (replicated attention, split out-projection) =======================
+                const int64_t qi = qsa_idx[(size_t) l];
+                const QsaState& st = ss.qsa_states[qi];
+                const WeightRef *wik = need(v, "indexer.k_proj.weight", err), *wq = need(v, "attn_q.weight", err),
+                                *wk = need(v, "attn_k.weight", err), *wv = need(v, "attn_v.weight", err),
+                                *wo = need(v, "attn_output.weight", err), *wiq = need(v, "indexer.q_proj.weight", err),
+                                *wqn = need(v, "attn_q_norm.weight", err), *wkn = need(v, "attn_k_norm.weight", err),
+                                *wiqn = need(v, "indexer.q_norm.weight", err), *wikn = need(v, "indexer.k_norm.weight", err);
+                if (!wik || !wq || !wk || !wv || !wo || !wiq || !wqn || !wkn || !wiqn || !wikn) return false;
+                if (!native_of(wq, v.name("attn_q.weight"), err) || !native_of(wk, v.name("attn_k.weight"), err) ||
+                    !native_of(wv, v.name("attn_v.weight"), err) || !native_of(wo, v.name("attn_output.weight"), err))
+                    return false;
+                auto norm_rope_on = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos) {
+                    if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, cs);
+                    else rms_norm_weighted(data, (const float*) norm->data, rows, cols, EPS, cs);
+                    if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) sh.n_rot, rope_scaling(), pos, cs);
+                    else rope_neox_apply(data, data, rows, cols, (int) sh.n_rot, st.cos_tab, st.sin_tab, pos, cs);
+                };
+                const bool fuse_nr = native_qsa_enabled() && native_rope_enabled() && native_norm_rope_usable((int) HD, (int) sh.n_rot);
+                auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos) {
+                    if (fuse_nr && native_norm_rope_usable(cols, (int) sh.n_rot)) {
+                        native_qsa_rms_norm_rope(data, cols, (const float*) norm->data, data, rows, cols, (int) sh.n_rot, EPS,
+                                                 rope_scaling(), pos, cs);
+                        return;
+                    }
+                    norm_rope_on(data, norm, rows, cols, pos);
+                };
+                float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
+                static const bool qb_q4 = [] {
+                    const char* e = std::getenv("STRATA_DF_QB_Q4");
+                    return e == nullptr || std::atoi(e) != 0;
+                }();
+                const bool qb = dec_batch && T > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
+                if (!q8_attn) quant_in(xm, (int) N);
+                // all of the mixer's projections: replicated (both cards hold full K/V and the full cache)
+                if (qb) bf16_gemv_fp32_mmvf_multi(xm, N, (const uint16_t*) wik->data, idx_raw, ID, N, ID, T, cs);
+                else for (int t = 0; t < te; ++t) bf16_gemv_fp32_mmvf(xm + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
+                copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
+                // k/v: the replicated full projections.  The grouped launch only runs under STRATA_MMVQ_V2, exactly
+                // as the single-card path; without it the call returns false and the buffers stay unwritten, so the
+                // plain per-matrix mmvqs (bitwise the grouped one's) must run instead
+                bool q_done = false;
+                if (native_mmvq_v2_enabled() && wk->native_type == 8 && wv->native_type == 8 && wq->native_type == 8)
+                    q_done = native_q8_0_mmvq_group(3, std::array<const void*, 3>{wk->native_data, wv->native_data, wq->native_data}.data(),
+                                       std::array<float*, 3>{kcur_, vcur_, qfull_}.data(),
+                                       std::array<int, 3>{(int) (NKV * HD), (int) (NKV * HD), (int) (NH * 2 * HD)}.data(),
+                                       xq_, (int) N, T, cs);
+                if (!q_done) {
+                    mm(wk, kcur_, (int) N, (int) (NKV * HD));
+                    mm(wv, vcur_, (int) N, (int) (NKV * HD));
+                }
+                if (m_tpdump_ != nullptr && l == 3) {   // DIAG: the k/v weight heads and the raw (pre-norm) k/v
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 528), wk->native_data, 16, cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 532), wv->native_data, 16, cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 536), wq->native_data, 16, cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 540), kcur_, 4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 544), vcur_, 4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                }
+                norm_rope(kcur_, wkn, (int) (T * NKV), (int) HD, pos_k);
+                if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp), exactly as the solo path
+                    fwht256_inplace_cuda(kcur_, (int64_t) T * NKV, cs);
+                    fwht256_inplace_cuda(vcur_, (int64_t) T * NKV, cs);
+                } else if (st.kv_hybrid) {   // K8V4: only V is rotated
+                    fwht256_inplace_cuda(vcur_, (int64_t) T * NKV, cs);
+                }
+                if (m_tpdump_ != nullptr && l == 3) {   // DIAG: the l3 intermediates, vs the solo path
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 492), kcur_, 4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 496), vcur_, 4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                }
+                {
+                    const int32_t* step_b = step_ + kStepPos;
+                    if (dec_batch && !g_no_batch_kv) {
+                        if (st.kv_hybrid) {
+                            const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
+                            const bool mirror = st.host.present();
+                            kv_append_q8_steps(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_b, kStepCount,
+                                               kcur_, kcur_, (int) (NKV * HD), T, sh, cs, mirror ? &hk : nullptr);
+                            kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_b, kStepCount, T, vcur_, vcur_, sh, cs,
+                                               mirror ? &hv : nullptr);
+                        } else if (st.kv_q4)
+                            kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, T, kcur_, vcur_, sh, cs, &st.host);
+                        else if (st.kv_int8)
+                            kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_b, kStepCount,
+                                               kcur_, vcur_, (int) (NKV * HD), T, sh, cs, &st.host);
+                        else
+                            for (int t = 0; t < te; ++t)
+                                kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount,
+                                               kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, sh, cs, &st.host);
+                    } else
+                        for (int t = 0; t < te; ++t)
+                            kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount,
+                                           kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, sh, cs, &st.host);
+                }
+                {
+                    const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                    if (dec_batch && !g_no_batch_kv) {
+                        native_qsa_indexer_append_steps(idx_raw, step_ + kStepPos, kStepCount, T, 0, (const float*) wikn->data,
+                                                        EPS, ib, sh, st.max_cells, rope_scaling(), cs);
+                    } else {
+                        for (int t = 0; t < te; ++t)
+                            native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+                                                      (const float*) wikn->data, EPS, ib, sh, st.max_cells, rope_scaling(), cs);
+                    }
+                }
+                stamp(l, 9);
+                // the queries: the q|gate projection, then the q/gate split with norm and RoPE
+                mm(wq, qfull_, (int) N, (int) (NH * 2 * HD));
+                if (qb) {
+                    if (fuse_nr) {
+                        native_qsa_rms_norm_rope(qfull_, (int) (2 * HD), (const float*) wqn->data, qcur_, (int) (T * NH), (int) HD,
+                                                 (int) sh.n_rot, EPS, rope_scaling(), pos_, cs);
+                    } else {
+                        copy_rows_strided(qcur_, qfull_, (int64_t) T * NH, HD, 2 * HD, cs);
+                        norm_rope(qcur_, wqn, (int) (T * NH), (int) HD, pos_);
+                    }
+                    if (st.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t) T * NH, cs);
+                } else {
+                    for (int t = 0; t < te; ++t) {
+                        float* qc = qcur_ + t * NH * HD;
+                        if (fuse_nr) {
+                            native_qsa_rms_norm_rope(qfull_ + t * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data, qc,
+                                                     (int) NH, (int) HD, (int) sh.n_rot, EPS, rope_scaling(), pos_ + t * NH, cs);
+                        } else {
+                            if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4,
+                                                  (size_t) HD * 4, (size_t) NH, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                                err = "verify: tp: the q/gate split failed";
+                                return false;
+                            }
+                            norm_rope(qc, wqn, (int) NH, (int) HD, pos_ + t * NH);
+                        }
+                        if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);
+                    }
+                }
+                if (m_tpdump_ != nullptr && l == 3)
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 500), qcur_, 4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                // the indexer's query, norm and RoPE, then the block selection
+                if (qb) {
+                    bf16_gemv_fp32_mmvf_multi(xm, N, (const uint16_t*) wiq->data, qidx_, IQ * ID, N, IQ * ID, T, cs);
+                    norm_rope(qidx_, wiqn, (int) (T * IQ), (int) ID, pos_i);
+                } else
+                    for (int t = 0; t < te; ++t) {
+                        float* qx = qidx_ + t * IQ * ID;
+                        bf16_gemv_fp32_mmvf(xm + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), cs);
+                        // the indexer's own position row: `pos_i` holds IQ entries per token (`pos_` is
+                        // MT*(NH+NKV+IQ), the q heads' rows first).  `pos_ + t*NH` is the q-head row and is only
+                        // right while NH == IQ by accident; with NH 24 and IQ 16 it read past the row.
+                        norm_rope(qx, wiqn, (int) IQ, (int) ID, pos_i + t * IQ);
+                    }
+                if (m_tpdump_ != nullptr && l == 3)
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 504), qidx_, 4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_, step_, T, max_blocks_, sh, scores_, cs);
+                qsa_block_topk(scores_, step_, T, max_blocks_, cap_, sh, sel_, cs);
+                if (m_tpdump_ != nullptr && l == 3) {
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 508), scores_, 4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 512), sel_, 4 * sizeof(int32_t), cudaMemcpyDeviceToHost, cs);
+                }
+                stamp(l, 11);
+                qsa_kv_resolve(st, g, sel_, step_, T, cap_, cs);
+                {
+                    const QsaAttnPools px = qsa_attn_pools(st);
+                    qsa_decode_attn_batch(qcur_, px, sel_, step_, cap_, sh, attn_scratch_, attn_, T, cs);
+                }
+                stamp(l, 13);
+                if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
+                if (m_tpdump_ != nullptr && l == 3)
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 516), attn_, 4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                if (qb) native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
+                else
+                    for (int t = 0; t < te; ++t) {
+                        if (native_qsa_enabled()) native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD,
+                                                                       attn32_ + t * NH * HD, (int) NH, (int) HD, cs);
+                        else qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, sh, attn32_ + t * NH * HD, cs);
+                    }
+                stamp(l, 14);
+                // The out-projection is COLUMN-parallel: each card holds half the OUTPUT ROWS and reduces the
+                // full NH*HD attention vector.  attn32_ already holds all NH heads on BOTH cards (the attention
+                // runs full width), so this needs no exchange at all - unlike the GDN side, whose value vector
+                // is head-split.  Every output element is bit-identical with the single card's
+                // (tests/core/tp_outproj_split_test.cu); the two cards' rows are disjoint.
+                native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
+                il_ready = false;
+                if (attn_full) {
+                    // STRATA_TP_ATTN_FULL=1 (diagnostic): rank 0 computes ALL N rows, rank 1 contributes zero.
+                    // Full width means n_out == N, so the kernel's own pitch already matches bo_ - no staging.
+                    if (tp_rank_ == 0) mm(wo, bo_, (int) (NH * HD), (int) N);
+                    else cudaMemsetAsync(bo_, 0, (size_t) T * N * sizeof(float), cs);
+                } else {
+                    // this card's own half of the output rows; the other half stays zero for the allreduce.
+                    // The kernel writes a COMPACT [T][N/2] (y[j*n_out + row]), so each token is pitched into
+                    // bo_'s [T][N] layout - a single flat write would shift every token after the first.
+                    mm(wo, half_out_, (int) (NH * HD), (int) (N / 2));
+                    for (int t = 0; t < T; ++t) {
+                        if (tp_rank_ == 0) {
+                            cudaMemcpyAsync(bo_ + (size_t) t * N, half_out_ + (size_t) t * (N / 2),
+                                            (size_t) (N / 2) * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+                            cudaMemsetAsync(bo_ + (size_t) t * N + N / 2, 0, (size_t) (N / 2) * sizeof(float), cs);
+                        } else {
+                            cudaMemsetAsync(bo_ + (size_t) t * N, 0, (size_t) (N / 2) * sizeof(float), cs);
+                            cudaMemcpyAsync(bo_ + (size_t) t * N + N / 2, half_out_ + (size_t) t * (N / 2),
+                                            (size_t) (N / 2) * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+                        }
+                    }
+                }
+                if (m_tpdump_ != nullptr && l == 3)   // DIAG: each rank's pre-allreduce l3 partial
+                    cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 520), bo_, 4 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+                stamp(l, 15);
+                if (!ring(l)) return false;
+            }
+        } catch (const std::exception& e) {
+            err = "verify layer " + std::to_string(l) + ": " + e.what();
+            return false;
+        }
+        stamp(l, 16);
+        const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);
+        stamp(l, 32);
+        if (m_tpdump_ != nullptr && l < 2)   // DIAG: the REAL MoE input (half 1, after the FFN-side read)
+            cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 100) + (size_t) l * 4, mixed_, 4 * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
+        if (m_tpdump_ != nullptr && l == 3)   // DIAG: the l3 MoE input, vs the solo path
+            cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 524), mixed_, 4 * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
+        // DIAG (STRATA_TP_VEC=N): site 0, this layer's mixer output in full (rank 0's block; the two cards read
+        // the same residual, so one copy is the pair's)
+        if (const int64_t vat = tp_vec_at(l, 0); vat >= 0 && tp_rank_ == 0)
+            cudaMemcpyAsync(m_tpdump_ + vat, mixed_, (size_t) tp_vec_len() * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
+        // ---- the router (replicated: the full residual is identical on both cards)
+        const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+        if (dec_batch && T > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+            try {
+                bf16_gemv_fp32_mmvf_multi(xm, N, (const uint16_t*) w_router->data, logits_, NE, N, NE, T, cs);
+                native_router_top10_multi(logits_, ids_, w_, T, cs);
+            } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
+        } else
+            for (int t = 0; t < te; ++t) {
+                MoEBuffers mb = ss.moe;
+                mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
+                if (!moe_route(wt, g, l, K, mb, xm + t * N, cs, err, nullptr)) return false;
+            }
+        // ---- the doorbell.  ONE doorbell for the pair: rank 0's.  Rank 1 shares rank 0's mapped sequence and
+        // plan words (tp_share_doorbell), so if BOTH cards published, the sequence would advance twice per layer.
+        if (ar_on()) {
+            resident_plan(ids_, (int) (T * K), (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
+                          hits_.cache_base, slot_off_d_, (long long) hits_.blob, plan_, (long long) max_t_ * K, nullptr, 0,
+                          cs, m_plan_err_);
+        } else if (tp_rank() == 0) {
+            if (device_plan_)
+                resident_plan(ids_, (int) (T * K), (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
+                              hits_.cache_base, slot_off_d_, (long long) hits_.blob, plan_, (long long) max_t_ * K, skip_,
+                              (uint32_t) ((l - lb_) * G + 1), cs);
+            if (remote_opt_ || always_publish_)
+                doorbell_publish(xm, ids_, w_, (int64_t) T * N, (int64_t) T * K, m_x_, m_ids_, m_w_, m_seq_, cs);
+            else {
+                const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
+                doorbell_publish_res(xm, ids_, layer_res, (int) g.n_expert, (int64_t) T * N, (int64_t) T * K, m_x_, m_ids_,
+                                     m_seq_, cs);
+            }
+        }
+        stamp(l, 17);
+        if (m_tpdump_ != nullptr && l < 2) {   // DIAG: the routing decision, before anything else touches it
+            cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 72) + (size_t) l * 8, ids_, 4 * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, cs);
+            cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 72) + (size_t) l * 8 + 4, w_, 4 * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
+        }
+        // ---- the shared expert (replicated, full width)
+        {
+            const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
+                            *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
+            if (!wgi || !wsg || !wsu || !wsd) return false;
+            if (!native_of(wsg, v.name("ffn_gate_shexp.weight"), err) || !native_of(wsu, v.name("ffn_up_shexp.weight"), err) ||
+                !native_of(wsd, v.name("ffn_down_shexp.weight"), err))
+                return false;
+            NativeSharedWeights nsw;
+            nsw.gate_type = wsg->native_type; nsw.gate_data = wsg->native_data;
+            nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
+            nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
+            nsw.q8_1 = xq_;
+            try {
+                if (dec_batch) f32_to_bf16_bulk(xm, sh_bf16_, (int64_t) T * N, cs);
+                else for (int t = 0; t < te; ++t) f32_to_bf16_bulk(xm + t * N, sh_bf16_ + t * N, N, cs);
+                shared_expert_multi((int) T, xm, sh_bf16_, nsw, (const uint16_t*) wgi->data, sh_gate_, sh_up_, sh_g_,
+                                    shared_, N, g.n_ff, cs, nullptr, 0);
+            } catch (const std::exception& e) {
+                err = std::string("verify shared expert: ") + e.what();
+                return false;
+            }
+        }
+        if (strata::kernels::cpu::expert_layout().native) {
+            if (!q8_ffn) quantize_q8_1_rows(xm, (int) T, (int) N, nat_xq_, cs);
+            // STRATA_POOL_ORDER=1: the pool's own activation contract alongside the q8_1 image (see the solo
+            // path's note).  The TP split's q8_0 calls read this one.
+            if (g_pool_order()) quantize_q8_0(xm, hit_xq_, (int64_t) T * N, cs);
+        } else
+            quantize_q8_0_scaled(xm, hit_xq_, hit_xs_, (int64_t) T * N, cs);
+        stamp(l, 18);
+        return true;
+    };
+
+    // ---------------------------------------------------------------- post(l): experts, combine
+    auto post = [&](int64_t l) -> bool {
+        const int64_t cap = (int64_t) T * K, capx = (int64_t) max_t_ * K;
+        int32_t* pl = plan_;
+        const int32_t* p_counts = pl;
+        const int32_t* p_start = pl + 4;
+        const int32_t* p_dst = p_start + capx + 1;
+        const int32_t* p_tok = p_dst + capx;
+        const int64_t ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+        const unsigned long long* p_ptr = (const unsigned long long*) (pl + ptr_off);
+        const unsigned long long* p_ptr2 = p_ptr + capx;
+        const int32_t* p_start2 = pl + ptr_off + 4 * capx;
+        float* hit_out = hit_out_;
+        float* parts_out = parts_;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        // ---- the experts.  BOTH cards compute a real half of every routed expert: the intermediate width is
+        // cut in two (tp_moe_), so rank r runs gate/up rows [r*n_ff/2, (r+1)*n_ff/2) and down's columns of the
+        // same range, and the two partial residuals add to the single-card one.  The residency table, the plan
+        // and the expert arena are rank 0's (P2P makes them readable from rank 1); the CPU rows arrive in the
+        // mapped block only on rank 0.
+        if (!tp_moe_ok_) {
+            err = "verify: tp: the experts' FFN split is not set up (tp_setup_scratch)";
+            return false;
+        }
+        const NativeExpertLayout Lgu = tp_moe_.layout;
+        const NativeExpertLayout Ldown = tp_moe_.down;
+        const unsigned long long grp_shift = (unsigned long long) tp_moe_.ptr_off;
+        const uint32_t want = (uint32_t) ((l - lb_) * G + 1);
+        {
+            const bool use_dev = tp_rank() == 0 && device_plan_;
+            if (use_dev) {
+                wait_flag_ge_or(m_flagA_, want, skip_, cs);
+                copy_i32_from_mapped_unless(pl, m_plan_, plan_i32_, skip_, want, cs);
+            } else {
+                wait_flag_ge(m_flagA_, want, cs);
+                copy_i32_from_mapped(pl, m_plan_, plan_i32_, cs);
+            }
+        }
+        // This rank's group pointers: the plan's own arrays shifted into private copies (the plan block is
+        // shared with the peer and rank 0 rewrites `p_ptr2` in place, so the shift cannot happen there).  The
+        // GATE/UP call uses these shifted pointers (the row offset is a group-pointer shift); the DOWN call
+        // uses the UNshifted plan pointers - its row offset lives in Ldown.down_off instead (half the output
+        // rows), and s_down is read from the unshifted group pointer's blob tail.
+        auto ensure_ptrs = [&]() -> bool {
+            if (grp_shift == 0) return true;
+            std::string serr;
+            return tp_shift_group_ptrs(p_ptr, tp_ptr_, capx, grp_shift, cs, serr);
+        };
+        auto ensure_ptrs2 = [&]() -> bool {
+            if (grp_shift == 0) return true;
+            std::string serr;
+            return tp_shift_group_ptrs(p_ptr2, tp_ptr2_, capx, grp_shift, cs, serr);
+        };
+        // The split experts run in TWO PHASES (the down needs the FULL intermediate the gate/up only half-
+        // produced).  `gu_split` runs the gate/up rows at the local width into `scratch` (its hq region holds the
+        // local hq the exchange reads); `down_split` runs the down rows (n_embd/2, full n_ff reduction) reading
+        // the assembled full hq from the SAME scratch's hq region, into the compact [cap][n_embd/2] output that
+        // `moe_hit_pitch` then pitches into hit_out's own half.  The phases are the native launcher's g_exp_phase
+        // (host, read at launch decision): 1 = gate/up + SwiGLU + q8_1 only, 2 = down only.  Set on the host here
+        // (before the launch) so the captured graph bakes in exactly those kernel sequences; record_window_tp
+        // restores phase 0 after the layer loop so the solo / other grouped calls see the full pipeline.
+        auto gu_split = [&](const unsigned long long* gp, const int32_t* gs2, const int32_t* gn, int64_t gy,
+                            void* scratch) {
+            if (lay.native) {
+                if (g_pool_order()) {
+                    // The pool-order split: gate/up at the LOCAL width (Lgu.n_ff = n_ff/2) from the q8_0
+                    // activation, then the intermediate quantized into THIS scratch's hq region - which is what
+                    // `exchange_hq` gathers and the down reads.  `native_expert_grouped_q8_0` does the quantize
+                    // inside phase 1, exactly where the q8_1 path's `swiglu_q8_1_entries_kernel` sat.
+                    native_expert_grouped_q8_0(Lgu, gp, gs2, gn, p_dst, p_tok, cap, cap, hit_xq_,
+                                               (int) ((g.n_embd / 32) * 34), scratch, hit_out, cs, 1, gy);
+                } else {
+                    native_expert_set_mode(-1, 1);
+                    native_expert_grouped(Lgu, gp, gs2, gn, p_dst, p_tok, cap, cap, nat_xq_, scratch, hit_out, cs, gy);
+                }
+            } else
+                moe_grouped_s2(gp, gs2, gn, p_dst, p_tok, cap, cap, hit_xq_, hit_xs_, hit_scratch_, hit_out, cs);
+        };
+        auto down_split = [&](const unsigned long long* gpd, const int32_t* gs2, const int32_t* gn, int64_t gy,
+                              void* scratch) {
+            if (!lay.native) return;   // S2 has no split down; the default path is native on this card
+            if (g_pool_order()) {
+                // The pool-order down: half the output rows (Ldown), the FULL n_ff reduction over the ASSEMBLED
+                // hq, one Q8_0 row per entry (the kernel maps entry e to activation row e itself).  The result is
+                // the compact [cap][n_embd/2] band the pitch then places in hit_out's own half.
+                native_expert_grouped_q8_0(Ldown, gpd, gs2, gn, p_dst, nullptr, cap, cap, nullptr, 0, scratch,
+                                           tp_moe_hitc_, cs, 2, gy);
+            } else {
+                native_expert_set_mode(-1, 2);
+                native_expert_grouped(Ldown, gpd, gs2, gn, p_dst, p_tok, cap, cap, nat_xq_, scratch, tp_moe_hitc_, cs, gy);
+            }
+            moe_hit_pitch(tp_moe_hitc_, hit_out, p_dst, cap, (int) g.n_embd, (int) (g.n_embd / 2),
+                          (int) (tp_rank() * (g.n_embd / 2)), cs);
+        };
+        // The exchange (copy only): assemble the full hq (this rank's local hq in `scratch` + the peer's over
+        // P2P) into `full_hq`.  `peer_base` is the peer's gate/up scratch BASE (fixed, set at setup); the
+        // per-window offset (cap = T*K) is added here because the local hq region sits at hq_off(cap, n_ff_local)
+        // inside that scratch - both ranks run the same window size, so both compute the same offset.  The
+        // handshake (wait the peer's flag, raise own) is done in the rank sections: ONE flag per direction,
+        // raised after BOTH group sets' gu, so set0's and set1's exchanges both sit after a single barrier.
+        auto exchange_hq = [&](void* scratch, void* full_hq, const uint8_t* peer_base) {
+            const uint8_t* local_hq = (const uint8_t*) scratch +
+                                      strata::kernels::native_expert_hq_off(cap, tp_moe_.n_ff_local);
+            const uint8_t* full_off = (const uint8_t*) full_hq +
+                                      strata::kernels::native_expert_hq_off(cap, tp_moe_.layout.n_ff * 2);
+            const uint8_t* peer_hq = peer_base + strata::kernels::native_expert_hq_off(cap, tp_moe_.n_ff_local);
+            const int half_blocks = (int) (tp_moe_.n_ff_local / 32);
+            const int own = (int) (tp_rank() * half_blocks);
+            // pool order: the intermediate is `block_q8_0` (34 bytes), so the exchange must move 34-byte blocks -
+            // the kernel is byte-granular for exactly this (see moe_hq_exchange_kernel).
+            moe_hq_exchange(local_hq, peer_hq, (uint8_t*) full_off, cap, half_blocks, own, cs,
+                            g_pool_order() ? 34 : 36);
+        };
+        static const bool moe_full = [] {   // DIAG: rank 0 computes the experts at FULL width, rank 1 contributes
+            // nothing: the allreduce then carries rank 0's single-card-math result, isolating the residency
+            // partition from the split itself.
+            const char* e = std::getenv("STRATA_TP_MOE_FULL");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        // STRATA_MOE_HQ_DUMP=1: capture-safe, one-shot (per process, per rank) layer-0 set0 hq dump.  The two
+        // D2H copies are GRAPH NODES into this rank's pinned staging (no host sync, no fopen here - record_window_tp
+        // runs inside cudaStreamBeginCapture, where a host sync aborts the capture and a host fwrite would write
+        // the unexecuted async copy).  The front is the ASSEMBLED full hq (this rank's view, read back through
+        // the same P2P path the down uses), the back this rank's LOCAL gate/up hq; taken right after the two
+        // exchange_hq calls so the assembled image is fully written and before the down reads it.  run_tp writes
+        // both ranks' buffers to disk after the window join (the buffers outlive the layer - they are pinned,
+        // not scratch the next layer reuses).
+        auto moe_hq_dump_on = [&]() -> bool {
+            if (m_moe_hq_diag_ == nullptr) return false;
+            const char* ge = std::getenv("STRATA_MOE_HQ_DUMP");
+            if (ge == nullptr || std::atoi(ge) == 0) return false;
+            if (moe_hq_dump_cap_ < 0) moe_hq_dump_cap_ = cap;   // the window's entry count (run_tp sizes the files)
+            return true;
+        };
+        // set 0 = tp_moe_hq_/tp_moe_scratch_ (the VRAM share), set 2 = tp_moe_hq2_/tp_moe_scratch2_ (the PCIe share).
+        // Staging is laid out at the capx (max window) size; the runtime copies only `cap` bytes into each slot, so
+        // the SET OFFSETS must be the capx region sizes (moe_hq_diag_hq_bytes_ and the capx local-hq size) - using
+        // the runtime `cap` there would misplace set2 and hit_out.  Layout: [set0 hq][set0 lq][set2 hq][set2 lq][hit_out].
+        const int64_t moe_blocks_full = (int64_t) (tp_moe_.layout.n_ff * 2) / 32;    // 20
+        const int64_t moe_blocks_local = (int64_t) tp_moe_.n_ff_local / 32;         // 10
+        const size_t moe_lq_region = (size_t) capx * (size_t) moe_blocks_local * 36;   // capx-sized per-set local hq
+        const size_t moe_set_region = (size_t) moe_hq_diag_hq_bytes_ + moe_lq_region;  // one set = hq slot + lq slot
+        auto dump_moe_hq_diag = [&](int set) {
+            if (!moe_hq_dump_on()) return;
+            const size_t hq_sz = (size_t) cap * (size_t) moe_blocks_full * 36;   // runtime: only `cap` entries
+            const size_t lq_sz = (size_t) cap * (size_t) moe_blocks_local * 36;
+            const void* hq_src = (set == 0 ? tp_moe_hq_ : tp_moe_hq2_);
+            const void* lq_src = (set == 0 ? tp_moe_scratch_ : tp_moe_scratch2_);
+            uint8_t* dst = h_moe_hq_diag_ + (size_t) (set / 2) * moe_set_region;  // set 0 -> 0, set 2 -> 1*region
+            if (cudaMemcpyAsync(dst, (const uint8_t*) hq_src +
+                                         strata::kernels::native_expert_hq_off(cap, (int64_t) tp_moe_.layout.n_ff * 2),
+                            hq_sz, cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata verify: tp: the hq dump's set%d assembled D2H failed\n", set);
+                return;
+            }
+            if (cudaMemcpyAsync(dst + (size_t) moe_hq_diag_hq_bytes_, (const uint8_t*) lq_src +
+                                          strata::kernels::native_expert_hq_off(cap, tp_moe_.n_ff_local),
+                            lq_sz, cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata verify: tp: the hq dump's set%d local D2H failed\n", set);
+            }
+        };
+        // After BOTH down_split calls: the pitched MoE band this rank owns (rank 0: cols [0, N/2), rank 1: the rest).
+        auto dump_moe_hitout = [&]() {
+            if (!moe_hq_dump_on()) return;
+            const size_t off = 2 * moe_set_region + (size_t) l * moe_hq_dump_hitc_sz_;   // per-layer slot
+            if (cudaMemcpyAsync(h_moe_hq_diag_ + off, hit_out_, (size_t) cap * (size_t) g.n_embd * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs) != cudaSuccess) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata verify: tp: the hq dump's hit_out D2H failed\n");
+            }
+        };
+        auto grouped_full = [&](const unsigned long long* gp, const int32_t* gs2, const int32_t* gn, int64_t gy) {
+            const auto& f = lay.fmt[(size_t) l];
+            const NativeExpertLayout Lfull = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            native_expert_grouped(Lfull, gp, gs2, gn, p_dst, p_tok, cap, cap, nat_xq_, hit_scratch_, hit_out, cs, gy);
+        };
+        stamp(l, 19);
+        if (m_tpdump_ != nullptr && l < 2 && tp_rank() == 0)   // DIAG: the plan's group counts (hits, CPU, PCIe)
+            cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 88) + (size_t) l * 4, p_counts, 3 * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, cs);
+        if (tp_rank() == 0) {
+            if (moe_full) {
+                grouped_full(p_ptr, p_start, p_counts, 0);
+                stamp(l, 20);
+                if (device_plan_) wait_flag_ge_or(m_flagB_, want, skip_, cs);
+                else wait_flag_ge(m_flagB_, want, cs);
+                if (sink_.pcie_mode == 2) {
+                    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                    uint8_t* stage = staging_ + (size_t) (0 * per) * lay.max_blob;
+                    const unsigned long long* p_dst2 = (const unsigned long long*) (pl + dst2_off_);
+                    fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs, p_dst2);
+                    rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs, p_dst2);
+                }
+                tp_raise_flag(tp_flag_f_d_, want, cs);
+                stamp(l, 21);
+                grouped_full(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows);
+                stamp(l, 22);
+                dump_moe_hitout();   // DIAG: rank 0's FULL-width MoE band (bit-exact reference for the split)
+            } else {
+                // SPLIT (two phases): gate/up for BOTH group sets, exchange the two local hq halves over P2P,
+                // then the down for both sets (n_embd/2 rows, full n_ff reduction) reading the assembled hq.
+                gu_split(p_ptr, p_start, p_counts, 0, tp_moe_scratch_);
+                stamp(l, 20);
+                if (device_plan_) wait_flag_ge_or(m_flagB_, want, skip_, cs);
+                else wait_flag_ge(m_flagB_, want, cs);
+                // the PCIe share: stage it with a copy kernel, then point the plan's pointers at the staging area
+                if (sink_.pcie_mode == 2) {
+                    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                    uint8_t* stage = staging_ + (size_t) (0 * per) * lay.max_blob;
+                    const unsigned long long* p_dst2 = (const unsigned long long*) (pl + dst2_off_);
+                    // Half-fetch: this rank copies only the byte windows its own kernels read (gate/up rows
+                    // [0,320) and down output rows [0,1280) plus the tail), so half the blob crosses this
+                    // card's x8 link while rank 1 copies the other half over its own.  Admitted cache slots take
+                    // mode 0 (the whole blob on THIS link) unless STRATA_TP_TWO_RANK_SLOT=1, which splits the fill
+                    // instead: measured 3% slower per window, because rank 1's half arrives as 16-byte peer stores.
+                    if (tp_half_fetch_)
+                        fetch_blobs_spans(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l),
+                                          tp_fetch_spans_[(size_t) l], (int) per, cs, p_dst2,
+                                          (tp_slot_cover_ && tp_two_rank_slot_) ? 2 : 0);
+                    else
+                        fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs, p_dst2);
+                    rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs, p_dst2);
+                }
+                tp_raise_flag(tp_flag_f_d_, want, cs);   // the staging area's pointers are final: rank 1 may read them
+                stamp(l, 21);
+                gu_split(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, tp_moe_scratch2_);
+                // both ranks' gate/up halves are now written: rank 1's local hq (both sets) is ready once it has
+                // raised flag_h; then assemble the full hq for both sets and tell rank 1 ours is ready (flag_i).
+                wait_flag_ge(tp_flag_h_d_, want, cs);
+                exchange_hq(tp_moe_scratch_, tp_moe_hq_, tp_moe_hq_peer_);
+                exchange_hq(tp_moe_scratch2_, tp_moe_hq2_, tp_moe_hq2_peer_);
+                dump_moe_hq_diag(0);  // DIAG: set0 assembled + local hq, after the exchange, before the down
+                dump_moe_hq_diag(2);  // DIAG: set2 (PCIe) assembled + local hq
+                tp_raise_flag(tp_flag_i_d_, want, cs);
+                // the down: half the output rows, full n_ff reduction, over the unshifted plan pointers.
+                down_split(p_ptr, p_start, p_counts, 0, tp_moe_hq_);
+                down_split(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, tp_moe_hq2_);
+                dump_moe_hitout();    // DIAG: this rank's pitched MoE band (set0 + set2), after both downs
+                // Stitch rank 1's band half into ours BEFORE the combine.  The single card reduces all K
+                // experts in one chain and adds the shared expert last; summing two per-rank chains instead
+                // gives a different fp32 association wherever the residency table put experts on the CPU -
+                // measured as a 1-ULP (7.45e-09 at 0.068) drift in rank 1's columns only, which the GR gate's
+                // q8_1 then amplified into a different token at t=1.  With the peer's half in place our
+                // `parts_` is byte-identical to the single card's input, so the combine reproduces it exactly.
+                // Rank 1 keeps its own half and publishes ZERO from its combine, so the allreduce below is a
+                // plain copy of this result to its `bo_` (`x + 0.0f` is bitwise `x`).
+                wait_flag_ge(tp_flag_j_d_, want, cs);
+                moe_hit_stitch(tp_moe_hitc_peer_, hit_out, p_dst, p_counts + 1, (int) cap, (int) g.n_embd,
+                               (int) (g.n_embd / 2), cs);
+                stamp(l, 22);
+            }
+            // the CPU share, then the hit rows: exactly the single-card path's order
+            if (device_plan_) {
+                wait_flag_ge_or(m_flag_, want, skip_, cs);
+                copy_or_zero_from_mapped(parts_out, m_ymiss_, (long long) T * K * N, skip_, want, cs);
+            } else {
+                const bool fuse_rows = fuse_rows_on() && !prof_on_ && !remote_opt_ && dec_batch && m_bal_ == nullptr;
+                if (!fuse_rows) {
+                    if (m_bal_ != nullptr)
+                        wait_flag_ge_stamped(m_flag_, want, nullptr, m_bal_ + ((l - lb_) * 2) * 4 + 2, cs);
+                    else wait_flag_ge(m_flag_, want, cs);
+                }
+                stamp(l, 23);
+                if (remote_opt_)
+                    remote_opt_->copy_rows(parts_out, m_ymiss_, 0, T, p_dst, p_counts + 1, cs);
+                else if (fuse_rows)
+                    copy_rows_from_mapped_after(m_flag_, want, parts_out, m_ymiss_, (int64_t) T * K, (int) N, p_dst,
+                                                p_counts + 1, cs);
+                else if (dec_batch)
+                    copy_rows_from_mapped(parts_out, m_ymiss_, (int64_t) T * K, (int) N, p_dst, p_counts + 1, cs);
+                else copy_from_mapped(parts_out, m_ymiss_, (int64_t) T * K * N, cs);
+            }
+            moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, (int) N, cs);
+            stamp(l, 24);
+            // rank 0 adds the shared expert; rank 1 does not, so the allreduce's sum carries it exactly once
+            native_moe_combine_multi(parts_, w_, shared_, bo_, (int) N, (int) K, (int) T, cs);
+            if (m_tpdump_ != nullptr && l < 2)   // DIAG: rank 0's own combine (it carries `shared_`)
+                cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 56) + (size_t) l * 4, bo_, 4 * sizeof(float),
+                                cudaMemcpyDeviceToHost, cs);
+            // DIAG (STRATA_TP_VEC=N): site 3, rank 0's OWN half-width partial, BEFORE the allreduce.  Rank 1
+            // never runs `run()` (only the coordinator does), so its half cannot be dumped by the same writer;
+            // `site1 - site3` is what rank 1 contributed, which is exactly the split's other half.
+            if (const int64_t vat = tp_vec_at(l, 3); vat >= 0)
+                cudaMemcpyAsync(m_tpdump_ + vat, bo_, (size_t) tp_vec_len() * sizeof(float),
+                                cudaMemcpyDeviceToHost, cs);
+            // wait for rank 1's partial, sum both bo_, tell rank 1 - one launch (P1); STRATA_TP_FUSED=0: three
+            {
+                std::string aerr;
+                if (!tp_fused) {
+                    wait_flag_ge(tp_flag_d_d_, want, cs);
+                    if (!tp_ar_.allreduce(bo_, tp_bo_peer_, (int64_t) T * N, cs, nullptr, aerr)) {
+                        err = "verify: tp MoE allreduce at layer " + std::to_string(l) + ": " + aerr;
+                        return false;
+                    }
+                    tp_raise_flag(tp_flag_e_d_, want, cs);
+                } else
+                if (!tp_ar_.allreduce_wait_raise(bo_, tp_bo_peer_, (int64_t) T * N, cs, tp_flag_d_d_, want,
+                                                 tp_flag_e_d_, want, aerr)) {
+                    err = "verify: tp MoE allreduce at layer " + std::to_string(l) + ": " + aerr;
+                    return false;
+                }
+            }
+        } else {
+            if (moe_full) {   // DIAG: rank 1 contributes zero; the allreduce then carries rank 0's full result
+                cudaMemsetAsync(bo_, 0, (size_t) T * N * sizeof(float), cs);
+                std::string aerr;
+                if (!tp_fused) {
+                    tp_raise_flag(tp_flag_d_d_, want, cs);
+                    wait_flag_ge(tp_flag_e_d_, want, cs);
+                } else
+                if (!tp_ar_.publish_wait(tp_flag_d_d_, want, tp_flag_e_d_, want, cs, aerr)) {
+                    err = "verify: tp MoE publish at layer " + std::to_string(l) + ": " + aerr;
+                    return false;
+                }
+            } else {
+            // rank 1: the plan block is rank 0's mapped copy, the staging area rank 0's device memory (P2P).
+            // Its own `parts_` holds only this card's half, so the CPU rows' slots must read as zero: clearing
+            // the buffer is what makes the weighted sum below leave them out (rank 0 owns those rows).
+            cudaMemsetAsync(parts_, 0, (size_t) T * K * N * sizeof(float), cs);
+            if (!ensure_ptrs()) {
+                err = "verify: tp: the expert pointers could not be shifted";
+                return false;
+            }
+            // SPLIT (two phases): gate/up for BOTH group sets (rank 1's half), then - once rank 0's halves are
+            // ready (flag_i) - assemble the full hq from rank 0's local hq (over P2P) and our own, and raise
+            // flag_h so rank 0's exchange may read OUR local hq.  THEN the down for both sets (n_embd/2 rows,
+            // full n_ff reduction) over the unshifted plan pointers.
+            gu_split(tp_ptr_, p_start, p_counts, 0, tp_moe_scratch_);
+            stamp(l, 20);
+            if (device_plan_) wait_flag_ge_or(m_flagB_, want, skip_, cs);
+            else wait_flag_ge(m_flagB_, want, cs);
+            // The PCIe share.  Half-fetch (the default): THIS rank copies its own byte windows of the miss blobs
+            // into its OWN staging area over its OWN x8 link, so both links carry the fetch in parallel; the plan's
+            // pointers are rebased to this rank's own address by the same deterministic kernel.  An admitted cache
+            // slot is skipped here (mode 1): rank 0 fills it whole and this card reads its half over NVLink.  With
+            // STRATA_TP_TWO_RANK_SLOT=1 this rank instead writes its windows INTO rank 0's slot (mode 2; measured
+            // slower, see the member's comment).  Fallback (no spans computed): rank 0 stages the whole blobs and
+            // this card reads that area over P2P, rebasing to rank 0's address (`tp_stage0_`, tp_share_doorbell).
+            if (sink_.pcie_mode == 2) {
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t) (0 * per) * lay.max_blob;
+                const unsigned long long* p_dst2 = (const unsigned long long*) (pl + dst2_off_);
+                if (tp_half_fetch_)
+                    fetch_blobs_spans(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l),
+                                      tp_fetch_spans_[(size_t) l], (int) per, cs, p_dst2,
+                                      (tp_slot_cover_ && tp_two_rank_slot_) ? 2 : 1);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, tp_half_fetch_ ? stage : tp_stage0_,
+                            (int64_t) lay.blob_bytes(l), cs, p_dst2);
+            }
+            // In the host-DMA modes (pcie_mode 0/1) the plan's pointers still address RANK 0's staging area (the
+            // pool thread wrote them into the mapped plan), so this rank reads that area over P2P and must wait
+            // for rank 0 to have seen its DMA land.  With the two-rank slot fill this rank never reads that area;
+            // otherwise (mode 1 skips it) it does not either, but the wait keeps the pair's phases aligned.
+            if (!tp_two_rank_slot_ || !tp_half_fetch_ || sink_.pcie_mode != 2) wait_flag_ge(tp_flag_f_d_, want, cs);
+            if (!ensure_ptrs2()) {
+                err = "verify: tp: the PCIe expert pointers could not be shifted";
+                return false;
+            }
+            stamp(l, 21);
+            gu_split(tp_ptr2_, p_start2, p_counts + 2, kPcieGroupRows, tp_moe_scratch2_);
+            // rank 1's halves are written: raise flag_h so rank 0's exchange may read our local hq, then wait
+            // for rank 0's halves (flag_i) and assemble both sets' full hq (rank 0's local hq over P2P).
+            tp_raise_flag(tp_flag_h_d_, want, cs);
+            wait_flag_ge(tp_flag_i_d_, want, cs);
+            exchange_hq(tp_moe_scratch_, tp_moe_hq_, tp_moe_hq_peer_);
+            exchange_hq(tp_moe_scratch2_, tp_moe_hq2_, tp_moe_hq2_peer_);
+            dump_moe_hq_diag(0);  // DIAG: set0 assembled + local hq, after the exchange, before the down
+            dump_moe_hq_diag(2);  // DIAG: set2 (PCIe) assembled + local hq
+            down_split(p_ptr, p_start, p_counts, 0, tp_moe_hq_);
+            down_split(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, tp_moe_hq2_);
+            dump_moe_hitout();    // DIAG: this rank's pitched MoE band (set0 + set2), after both downs
+            // Our compact band half is final: tell rank 0 it may stitch it into its full-width band.
+            tp_raise_flag(tp_flag_j_d_, want, cs);
+            stamp(l, 22);
+            stamp(l, 23);
+            moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, (int) N, cs);
+            stamp(l, 24);
+            native_moe_combine_multi(parts_, w_, nullptr, bo_, (int) N, (int) K, (int) T, cs);
+            // Rank 0 now combines at FULL width (it stitched our half in above), so it already holds the
+            // single card's result.  Publish zero: the allreduce below becomes a plain copy of rank 0's
+            // `bo_` into ours (`x + 0.0f` is bitwise `x`), instead of summing two per-rank chains - which is
+            // a different fp32 association from the single card's one-chain-then-shared order.
+            cudaMemsetAsync(bo_, 0, (size_t) T * N * sizeof(float), cs);
+            if (m_tpdump_ != nullptr && l < 2)   // DIAG: rank 1's own combine (it carries no `shared_`)
+                cudaMemcpyAsync(m_tpdump_ + (size_t) (g.n_layers * 8 + 64) + (size_t) l * 4, bo_, 4 * sizeof(float),
+                                cudaMemcpyDeviceToHost, cs);
+            // publish this card's partial, then wait for rank 0's sum - one launch (P1); STRATA_TP_FUSED=0: two
+            {
+                std::string aerr;
+                if (!tp_fused) {
+                    tp_raise_flag(tp_flag_d_d_, want, cs);
+                    wait_flag_ge(tp_flag_e_d_, want, cs);
+                } else
+                if (!tp_ar_.publish_wait(tp_flag_d_d_, want, tp_flag_e_d_, want, cs, aerr)) {
+                    err = "verify: tp MoE publish at layer " + std::to_string(l) + ": " + aerr;
+                    return false;
+                }
+            }
+            }
+        }
+        // STRATA_TP_DUMP=1: the residual's head, per layer (see h_tpdump_)
+        if (m_tpdump_ != nullptr)
+            cudaMemcpyAsync(m_tpdump_ + (size_t) l * 8, bo_, 8 * sizeof(float), cudaMemcpyDeviceToHost, cs);
+        // DIAG (STRATA_TP_VEC=N): site 1, this layer's combined residual in full - the allreduce's sum, which is
+        // what the next layer reads
+        if (const int64_t vat = tp_vec_at(l, 1); vat >= 0)
+            cudaMemcpyAsync(m_tpdump_ + vat, bo_, (size_t) tp_vec_len() * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
+        if (l == g.n_layers - 1) {
+            if (!fuse_head_gr) {
+                if (dec_batch && !g_no_multi_gr) gr_write_multi(Rt(0), bo_, inj2_, gs, Rt(0), (int) T, cs);
+                else for (int t = 0; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+                if (cvec().covers(l)) cvec_apply(Rt(0), l, T, HC * N, nullptr, 0, nullptr, 0, false, cs);
+            }
+        } else if (cvec().covers(l)) {
+            cvec_apply(Rt(0), l, T, HC * N, bo_, (int) N, inj2_, (int) HC, true, cs);
+        }
+        // NOTHING else writes the residual streams here.  The ordinary window folds this layer's FFN write
+        // into the NEXT layer's hyper-connection read (`gr_read_group` with `apply`); doing it here as well
+        // applied it twice (layer 1's residual ended up 3% off while layer 0's bo_ matched to 1e-8).
+        return true;
+    };
+
+    // ---------------------------------------------------------------- the layer loop
+    if (!pre(lb_)) return false;
+    for (int64_t l = lb_; l < le_; ++l) {
+        if (!post(l)) return false;
+        if (l + 1 < le_ && !pre(l + 1)) return false;
+    }
+    // The split experts left g_exp_phase at the last call's value (2 for the native split down).  Restore the
+    // full pipeline so any non-TP `native_expert_grouped` call this process makes afterward (the bench, a later
+    // capture) is not left down-only.
+    native_expert_set_mode(-1, 0);
+
+    // ---- the head (replicated: the full residual is the same on both cards)
+    if (le_ < g.n_layers) {
+        err = "verify: tp: a layer split with tensor parallelism is not supported";
+        return false;
+    }
+    {
+        // The final hyper-connection mixer, exactly the solo path's: `head_mixed_` is the MIXED n_embd vector, not a
+        // copy of stream 0.  This block used to look for `output_hc_mix.weight` / `output_hc_inject.weight`, which no
+        // manifest carries (family_layout.hpp declares only output_hc_{norm,down,up}), so it always fell through to
+        // `copy_from_mapped(head_mixed_, Rt(0), T*N)` - stream 0 of the 4 hyper-connection streams, with the mixer
+        // never run.  That fed the head a tensor ~1/hc the right size: measured |A|=146.8 (solo) vs |B|=22.8 (TP),
+        // relL2 0.91, which is why every TP logit was ~4x too small.
+        const WeightRef *won = wt.find("output_hc_norm.weight"), *wod = wt.find("output_hc_down.weight");
+        const WeightRef *wou = wt.find("output_hc_up.weight");
+        if (won == nullptr || wod == nullptr || wou == nullptr) {
+            err = "verify: tp: an output_hc_* weight is missing";
+            return false;
+        }
+        {
+            // The last layer's residual write was done at the end of the layer loop above (its `l == n_layers - 1`
+            // branch), so this read never folds a pending write - unless STRATA_FUSE_HEAD_GR=1 skipped that write,
+            // in which case the read applies it, exactly as solo's fuse_head_gr branch does.
+            if (head_mix_multi_enabled() && head_ != nullptr && head_->loaded()) {
+                if (won->kind != WeightKind::F32 || wod->kind != WeightKind::Bf16InF32 ||
+                    wou->kind != WeightKind::Bf16InF32) {
+                    err = "verify: tp: the output_hc_* weights have the wrong engine forms";
+                    return false;
+                }
+                FusedGrArgs fa[kFusedGrMaxT];
+                for (int t = 0; t < T; ++t) {
+                    FusedGrArgs& a = fa[t];
+                    a.R = Rt(t); a.R_out = Rt(t); a.apply = fuse_head_gr;
+                    a.bo_prev = bo_ + t * N; a.inj_prev = inj2_ + t * HC;
+                    a.w_norm = (const float*) won->data; a.w_down = (const uint16_t*) wod->data;
+                    a.w_up = (const uint16_t*) wou->data; a.eps = EPS;
+                    a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC; a.mixed = head_mixed_ + t * N;
+                }
+                fused_gr_read_multi(fa, T, xn_, cs);
+            } else {
+                if (fuse_head_gr) {
+                    for (int t = 0; t < T; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
+                }
+                for (int t = 0; t < T; ++t) {
+                    BlockBuffers bb = ss.block;
+                    bb.R = Rt(t);
+                    bb.mixed = head_mixed_ + t * N;
+                    if (!lm_head_mix(wt, g, bb, cs, err)) return false;
+                }
+            }
+        }
+        if (head_ == nullptr || !head_->loaded()) { err = "verify: tp: the head is not loaded"; return false; }
+        // DIAG (STRATA_TP_VEC=N): site 2 of the pseudo-layer g.n_layers, the head's input in full
+        if (const int64_t vat = tp_vec_at(g.n_layers, 2); vat >= 0)
+            cudaMemcpyAsync(m_tpdump_ + vat, head_mixed_, (size_t) tp_vec_len() * sizeof(float),
+                            cudaMemcpyDeviceToHost, cs);
+        native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
+        native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
+        // The greedy pick, by the SAME rule the solo window uses.  This used to call `argmax_rows` unconditionally,
+        // while solo calls it only when `argmax_rows_wanted()` - which is false on this hardware (it needs compute
+        // capability 8.x; these are 2080 Tis, sm_75), so solo takes `sample_tokens`' greedy branch and the two paths
+        // were picking with different kernels.  Both are greedy with the same tie rule (`arg_take`:
+        // `ov > bv || (ov == bv && oi < bi)`), but a pick is the one place a difference is not a rounding error:
+        // it is the token.  Same branch, same call, so the two paths cannot drift apart here.
+        if (argmax_rows_wanted()) {   // sm_80 to sm_89: the pick over many blocks a row (bitwise the one-block kernel's)
+            argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
+        } else {
+            SamplerParams sp;
+            sp.greedy = true;
+            sp.temperature = 0.0f;
+            sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+        }
+        if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
+    }
+    return true;
+}
+
+// ---- the TP window: one coordinator call drives both cards
+bool Verifier::run_tp(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                      std::string& err) {
+    using namespace strata::kernels;
+    if (!tp_on_) { err = "verify: run_tp on a verifier that is not a TP rank"; return false; }
+    if (tp_rank_ != 0) { err = "verify: run_tp must be called on rank 0 (the coordinator)"; return false; }
+    if (tp_peer_ == nullptr || !tp_peer_->tp_on_) { err = "verify: run_tp needs the peer verifier (set_tp_peer)"; return false; }
+    if (T < 1 || T > max_t_ || T > tp_peer_->max_t_) { err = "verify: tp window size out of range"; return false; }
+    if (released_.load() || tp_peer_->released_.load()) {
+        err = "verify: an earlier window never finished on the GPU (#267); restart the engine";
+        return false;
+    }
+    if (pos0 + T > ss_->qsa_states[ss_->qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    if (tp_peer_->ss_->qsa_states[tp_peer_->ss_->qsa_primary()].max_cells < pos0 + T) {
+        err = "verify: the peer's window runs past the context";
+        return false;
+    }
+    // Self-check (once per rank): can THIS rank read the PEER's device memory?  The experts' FFN split has
+    // rank 1 reading rank 0's expert arena and PCIe staging area over P2P, a direction no earlier TP path used
+    // (the allreduce and the broadcast are rank 0's kernels touching rank 1's buffers).  With peer access off
+    // the fault lands inside the window graph and surfaces only as "layer N never rang".
+    if (tp_bo_peer_ != nullptr && tp_exec_[T] == nullptr) {
+        float got = -12345.0f;
+        const cudaError_t ce = cudaMemcpy(&got, tp_bo_peer_, sizeof(float), cudaMemcpyDeviceToHost);
+        (void) cudaGetLastError();
+        if (ce != cudaSuccess) {
+            err = std::string("verify: tp: rank ") + std::to_string(tp_rank_) +
+                  " cannot read the peer's device memory (P2P): " + cudaGetErrorString(ce);
+            return false;
+        }
+    }
+    // The TP window is captured with the HOST-DOORBELL expert plan: rank 0's pool publishes each layer's plan into
+    // the mapped block, and the post (4357) spins on m_flagA_ / m_flagB_ / m_flag_ for it.  There is NO zero-doorbell
+    // variant: record_window_tp's post unconditionally waits on those flags, and run_tp's host loop that would raise
+    // them (the doorbell loop below) is skipped entirely when ar_on().  So the all-resident graph solo takes when
+    // every expert is in VRAM would hang a TP window forever - the post spins on flags no host thread ever raises.
+    // Force the doorbell graph: all_resident_ = false makes ar_on() false on both ranks, selecting the path that is
+    // actually implemented.  On 2x 22GiB the 125B expert set is never 100% resident (init prints no
+    // "zero-doorbell" line), so this changes nothing here; it only closes the hang on a machine where it would be.
+    if (all_resident_ || tp_peer_->all_resident_) {
+        all_resident_ = false;
+        tp_peer_->all_resident_ = false;
+        std::fprintf(stderr, "strata verify: tp: the window runs the host-doorbell expert plan (the zero-doorbell "
+                             "all-resident graph is not implemented for TP and would hang: its post waits on doorbell "
+                             "flags no host loop raises)\n");
+    }
+    // both cards' windows are captured once (this is a graph of both the dense half and the replicated MoE)
+    if (!capture_tp(T, err)) return false;
+    // Rank 1 shares rank 0's doorbell (the experts are replicated, so the plan is the same) - install it BEFORE
+    // rank 1's graph is captured, because the plan block and the flag words are baked into that graph.
+    tp_peer_->tp_share_doorbell(*this);
+    // The dump block stays this rank's own: it is mapped pinned HOST memory, and a device pointer resolved on
+    // one card is not writable from the other (unlike the P2P-visible device buffers it is not portable).
+    if (!tp_peer_->capture_tp(T, err)) return false;
+    if (!capture_commit_tp(err)) return false;
+    if (!tp_peer_->capture_commit_tp(err)) return false;
+    // the layer loop's handshake flags start at 0 for this window.  This runs on EVERY request, not just the
+    // first: capture_tp() above returns early once the graph exists, but these words are the graphs' runtime
+    // mailbox and carry last request's high-water mark (flag g ends at 2*n_layers = 96).  A flag left raised
+    // makes every `wait_flag_ge` in the next request return at once, so a rank reads its peer's buffer before
+    // the P2P write has landed.  Flag g is the GDN value-half handshake of the default column-parallel
+    // out-projection (not just the FULL diagnostic), so it must be reset with the others.  Both ranks' pointers
+    // name the SAME host words (tp_setup_flags hands the peer this rank's allocation): one store clears the pair.
+    *(volatile uint32_t*) tp_flag_a_h_ = 0;
+    *(volatile uint32_t*) tp_flag_b_h_ = 0;
+    // flag c is the OTHER direction of that same value-half exchange: rank 0 raises it after its half has
+    // landed in rank 1's y_full_[0, ZVt), and rank 1 spins on it.  Leaving it out here cost a whole window:
+    // the word still held 2*n_layers from the previous request, so rank 1's `wait_flag_ge(c, l + 1)` returned
+    // at once and it quantized `y_full_` before rank 0's broadcast landed - its 1280 rows then came from the
+    // previous layer's values, and the per-layer allreduce was wrong in every element.
+    *(volatile uint32_t*) tp_flag_c_h_ = 0;
+    *(volatile uint32_t*) tp_flag_d_h_ = 0;
+    *(volatile uint32_t*) tp_flag_e_h_ = 0;
+    *(volatile uint32_t*) tp_flag_f_h_ = 0;
+    *(volatile uint32_t*) tp_flag_g_h_ = 0;
+    // flags h / i are the MoE hq exchange handshake (the split down's two-phase gate/up -> down).  Like the
+    // others they are `want`-valued high-water marks a raise is a plain store into, so a leftover value from the
+    // previous request would make wait_flag_ge return at once; both ranks name the same host words.
+    *(volatile uint32_t*) tp_flag_h_h_ = 0;
+    *(volatile uint32_t*) tp_flag_i_h_ = 0;
+    // flag j is the MoE band stitch handshake (rank 1 -> rank 0: "my pitched band half is final, read it").  It
+    // carries `want` like the others, so a word still holding 48 from the previous request makes rank 0's very
+    // first `wait_flag_ge(j, 1)` return at once: it stitches rank 1's PREVIOUS-request band half into this
+    // window's first layer, which shows up as a whole-band error (0.29 at window 1's L0, rank 1's columns only -
+    // the exact shape the stitch reads) rather than an ULP.  Every other flag is listed here; this one must be too.
+    *(volatile uint32_t*) tp_flag_j_h_ = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    // both cards stage the same tokens/positions: their dense halves read the same residual
+    stage_inputs(T, tokens, pos0);
+    {
+        const OnDevice on_peer(tp_peer_->device_);
+        tp_peer_->stage_inputs(T, tokens, pos0);
+    }
+    // The PLE rows: layer 1's block reads `m_ple_`, and in the ordinary window run()'s host thread gathers them
+    // (ngram_rows from the session's last two tokens, then the table read).  run_tp has no host doorbell - the
+    // graphs run to completion - so the gather happens here, before either graph is launched.  Both ranks read
+    // their own mapped row block (`init` mapped one per verifier) and the rows do not differ between the cards
+    // (they hash the token window), so each rank's block is filled from the same `ple_rows`.
+    if (ple_stage() && ss_->ple.ready()) {
+        uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];
+        int32_t prev[2] = {ss_->ple_prev[0], ss_->ple_prev[1]};
+        for (int t = 0; t < T; ++t) {
+            ngram_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows + t * PLE_N_HEADS);
+            prev[0] = prev[1];
+            prev[1] = tokens[t];
+            ss_->ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
+        }
+        if (!ss_->ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
+        if (tp_peer_->ple_stage() && tp_peer_->ss_->ple.ready() && tp_peer_->h_ple_ != nullptr &&
+            !tp_peer_->ss_->ple.table->gather_batch(ple_rows, (size_t) T, tp_peer_->h_ple_, err))
+            return false;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+    }
+    // ARRANGE: rank 1's window must be launched BEFORE rank 0's, so that rank 1's first layer's partial is
+    // already on its way when rank 0's first wait spins.  (The spin kernels make the order safe either way -
+    // whichever graph starts first just waits - but starting the consumer last keeps the critical path short.)
+    {
+        const OnDevice on_peer(tp_peer_->device_);
+        const cudaError_t le = cudaGraphLaunch(tp_peer_->tp_exec_[T], tp_peer_->cs_);
+        if (le != cudaSuccess) { err = std::string("verify: tp peer launch: ") + cudaGetErrorString(le); return false; }
+    }
+    {
+        const OnDevice on_self(device_);
+        const cudaError_t le = cudaGraphLaunch(tp_exec_[T], cs_);
+        if (le != cudaSuccess) {
+            err = std::string("verify: tp launch: ") + cudaGetErrorString(le);
+            (void) tp_peer_->release_gpu_waits(5000);   // no spin kernel may outlive this call
+            return false;
+        }
+    }
+    // the window runs both graphs to completion.  Rank 1 finishes on its own after its last layer; rank 0's
+    // graph ends with the head.  Neither graph has a host-side doorbell (the experts are VRAM resident), so the
+    // coordinator only hands the CPU experts over if the caller supplied a pool.
+    if (ar_on()) {
+        // the all-resident graph serves no layer from the host: both graphs run to completion
+    } else {
+        // the doorbell path: rank 0's graph publishes each layer's plan as it reaches it
+        const int G = 1;
+        const int64_t steps = (le_ - lb_) * G;
+        volatile uint32_t* const seq = h_seq_;
+        volatile uint32_t* const flag = h_flag_;
+        for (int64_t k = 0; k < steps; ++k) {
+            const int64_t l = lb_ + k / G;
+            const uint32_t want = (uint32_t) (k + 1);
+            const Clock::time_point a = Clock::now();
+            uint32_t spins = 0;
+            progress_at("verify tp window: waiting for the GPU to reach layer", l);
+            while (*seq < want) {
+                _mm_pause();
+                if ((++spins & 1023u) != 0) continue;
+                const cudaError_t q = cudaStreamQuery(cs_);
+                if (q != cudaErrorNotReady && *seq < want) {
+                    err = "verify: tp: layer " + std::to_string(l) + " never rang (" +
+                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+                    (void) tp_peer_->release_gpu_waits(5000);
+                    return false;
+                }
+                if (Clock::now() - a > std::chrono::seconds(6)) {
+                    // the GPU is stuck: the flags say WHERE (a card waiting on the other's handshake, or a
+                    // layer that never reached its doorbell)
+                    std::fprintf(stderr,
+                                 "strata verify: tp stall at layer %lld: seq=%u want=%u flag_a=%u flag_b=%u "
+                                 "(peer flag_a=%u flag_b=%u)\n",
+                                 (long long) l, (unsigned) *seq, (unsigned) want,
+                                 (unsigned) *(volatile uint32_t*) tp_flag_a_h_, (unsigned) *(volatile uint32_t*) tp_flag_b_h_,
+                                 (unsigned) *(volatile uint32_t*) tp_peer_->tp_flag_a_h_,
+                                 (unsigned) *(volatile uint32_t*) tp_peer_->tp_flag_b_h_);
+                    err = "verify: tp: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000));
+                    (void) tp_peer_->release_gpu_waits(5000);
+                    return false;
+                }
+            }
+            cur_layer_ = want - 1;
+            set_plan_slot(k % G);
+            const int tb = 0, n = T;
+            if (pool != nullptr)
+                pool(user, h_x_ + (size_t) tb * g_->n_embd, h_ids_ + (size_t) tb * ss_->k, n, ss_->k,
+                     h_ymiss_ + (size_t) tb * ss_->k * g_->n_embd, l);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            _mm_sfence();
+            if (*(volatile uint32_t*) h_flagA_ != want) {   // the pool published no plan: an empty one
+                sink_.counts[0] = 0;
+                sink_.counts[1] = 0;
+                sink_.counts[2] = 0;
+                sink_.start[0] = 0;
+                sink_.start2[0] = 0;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                *(volatile uint32_t*) h_flagA_ = want;
+                raise_flag(h_flagB_, want);
+            }
+            *flag = want;
+        }
+    }
+    // both graphs are still in flight; join them
+    {
+        const cudaError_t se = cudaStreamSynchronize(cs_);
+        if (se != cudaSuccess) {
+            err = std::string("verify: tp: ") + cudaGetErrorString(se);
+            (void) tp_peer_->release_gpu_waits(5000);
+            return false;
+        }
+        const OnDevice on_peer(tp_peer_->device_);
+        const cudaError_t pe = cudaStreamSynchronize(tp_peer_->cs_);
+        if (pe != cudaSuccess) {
+            err = std::string("verify: tp peer: ") + cudaGetErrorString(pe);
+            return false;
+        }
+    }
+    // #871, the same check solo makes at both of its exits (verify.cpp:2911 and 2935).  `refresh_ar` leaves this
+    // word set when the residency table changed mid-window and a layer then met an expert that is not in VRAM -
+    // the graph still runs, serving that layer from whatever the plan held, so the window's tokens are wrong.
+    // TP passed `m_plan_err_` into `resident_plan` (4282) and then never read it: a window that hit the race
+    // returned tokens instead of an error.  Cleared on read exactly as solo clears it, so the next window starts
+    // from a known state.
+    if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {
+        *(volatile uint32_t*) h_plan_err_ = 0;
+        err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
+        return false;
+    }
+    if (copy_used_) {
+        cudaStreamSynchronize(copy_);
+        copy_used_ = false;
+    }
+    // STRATA_MOE_HQ_DUMP=1: both ranks' graphs are joined (their D2H nodes complete), so write the one-shot
+    // layer-0 set0 hq to disk - the ASSEMBLED full hq (each rank's own view, read back through the same P2P
+    // path the down uses) and the rank's LOCAL gate/up hq.  Both ranks write their own buffer; the two .hq
+    // files must be byte-identical if the P2P hq exchange is clean (rank 0's down is bit-exact, so the
+    // divergence - if any - is in the hq image rank 1 assembles from rank 0's P2P half).
+    if (h_moe_hq_diag_ != nullptr && !moe_hq_dump_written_ && moe_hq_dump_cap_ > 0) {
+        const char* ge = std::getenv("STRATA_MOE_HQ_DUMP");
+        if (ge != nullptr && std::atoi(ge) != 0) {
+            const int64_t capd = moe_hq_dump_cap_;
+            const size_t hq_sz = (size_t) capd * (size_t) ((tp_moe_.layout.n_ff * 2) / 32) * 36;
+            const size_t lq_sz = (size_t) capd * (size_t) (tp_moe_.n_ff_local / 32) * 36;
+            const size_t hit_sz = (size_t) capd * (size_t) g_->n_embd * sizeof(float);
+            const size_t lq_region = (size_t) ((int64_t) max_t_ * (int64_t) ss_->k) *
+                                     (size_t) (tp_moe_.n_ff_local / 32) * 36;   // the capx-sized local-hq slot
+            const size_t set_region = (size_t) moe_hq_diag_hq_bytes_ + lq_region;  // one set = hq slot + lq slot
+            const char* base = std::getenv("STRATA_MOE_HQ_DUMP_FILE");
+            if (base == nullptr) base = "/tmp/strata_moe_hq_dump";
+            auto w2 = [&](const char* tag, const Verifier* self, const Verifier* peer) {
+                if (self == nullptr) return;
+                const uint8_t* s0 = self->h_moe_hq_diag_;                        // set0 hq slot
+                const uint8_t* s0l = self->h_moe_hq_diag_ + (size_t) moe_hq_diag_hq_bytes_;
+                const uint8_t* s2 = self->h_moe_hq_diag_ + set_region;           // set2 hq slot
+                const uint8_t* s2l = self->h_moe_hq_diag_ + set_region + (size_t) moe_hq_diag_hq_bytes_;
+                const std::string r = std::to_string((int) self->tp_rank_);
+                const std::string pref = std::string(base) + tag;
+                const std::vector<std::string> names = { pref + "0.hq" + r, pref + "0.lq" + r, pref + "2.hq" + r,
+                                                         pref + "2.lq" + r };
+                const uint8_t* ptrs[] = { s0, s0l, s2, s2l };
+                const size_t nsz[] = { hq_sz, lq_sz, hq_sz, lq_sz };
+                for (int i = 0; i < 4; ++i) {
+                    if (FILE* f = std::fopen(names[i].c_str(), "wb")) {
+                        std::fwrite(ptrs[i], 1, nsz[i], f);
+                        std::fclose(f);
+                    }
+                }
+                // the per-layer MoE band (ho_<l>.<rank>): find the first diverging layer vs the mofull band.
+                for (int64_t ll = 0; ll < g_->n_layers; ++ll) {
+                    const std::string hn = pref + "ho_" + std::to_string((int) ll) + "." + r;
+                    const uint8_t* ho = self->h_moe_hq_diag_ + 2 * set_region + (size_t) ll * hit_sz;
+                    if (FILE* f = std::fopen(hn.c_str(), "wb")) {
+                        std::fwrite(ho, 1, hit_sz, f);
+                        std::fclose(f);
+                    }
+                }
+            };
+            w2(".hq", this, nullptr);
+            if (tp_peer_ != nullptr) w2(".hq", tp_peer_, nullptr);
+            moe_hq_dump_written_ = true;
+            std::fprintf(stderr,
+                         "strata verify: tp: wrote the layer-0 set0+set2 hq dump (cap %lld, hq %zu B, lq %zu B, hit %zu B "
+                         "per rank)\n",
+                         (long long) capd, hq_sz, lq_sz, hit_sz);
+        }
+    }
+    // STRATA_GDN_VALDUMP: the per-rank GDN value vectors staged by record_window_tp's IN-capture D2H (pinned, graph
+    // nodes) now hold window-0 data - both window graphs have launched and the streams synced above, so the copies
+    // have landed in pinned memory.  run_tp runs on RANK 0 (it launches the peer's graph too), so write BOTH ranks'
+    // files from here: each rank's capture filled its own file-scope index (g_gdnval_*_[r], shared across the process).
+    if (std::getenv("STRATA_GDN_VALDUMP") != nullptr) {
+        static const char* vfn = std::getenv("STRATA_GDN_VALDUMP_FILE");
+        static bool vwr = false;
+        if (vfn != nullptr && !vwr && g_gdnval_T_ > 0) {
+            for (int r = 0; r < 2; ++r) {
+                if (!g_gdnval_fired_[r] || g_gdnval_full_h_[r] == nullptr || g_gdnval_half_h_[r] == nullptr) continue;
+                if (FILE* f = std::fopen((std::string(vfn) + ".full.rank" + std::to_string(r)).c_str(), "wb")) {
+                    std::fwrite(g_gdnval_full_h_[r], sizeof(float), (size_t) g_gdnval_T_ * (size_t) g_gdnval_ZV_, f);
+                    std::fclose(f);
+                }
+                if (FILE* f = std::fopen((std::string(vfn) + ".half.rank" + std::to_string(r)).c_str(), "wb")) {
+                    std::fwrite(g_gdnval_half_h_[r], sizeof(float), (size_t) g_gdnval_T_ * (size_t) g_gdnval_ZVt_, f);
+                    std::fclose(f);
+                }
+                std::fprintf(stderr, "strata verify: tp: GDN value dump rank %d (T=%d ZV=%d ZVt=%d)\n",
+                             r, g_gdnval_T_, g_gdnval_ZV_, g_gdnval_ZVt_);
+            }
+            vwr = true;
+        }
+    }
+    if (prof_on_) collect_profile();
+    if (!sample_window(T, tokens, pos0, err)) return false;
+    for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    note_nonfinite(T, nullptr);
+    if (h_tpdump_ != nullptr) {
+        {
+            // rank 1's probes live in ITS mapped block (the dump buffer is not shared across devices)
+            const float* h1 = tp_peer_ != nullptr ? tp_peer_->h_tpdump_ : nullptr;
+            const size_t base0 = (size_t) g_->n_layers * 8;
+            {
+                const float* x0 = h_tpdump_ + base0 + 96;
+                const float* x1 = h1 ? h1 + base0 + 96 : nullptr;
+                std::fprintf(stderr, "TPDUMP tp XM1 r0=%.9e,%.9e r1=%.9e,%.9e\n",
+                             (double) x0[0], (double) x0[1],
+                             x1 ? (double) x1[0] : 0.0, x1 ? (double) x1[1] : 0.0);
+            }
+            {
+                const float* m0 = h_tpdump_ + base0 + 100;
+                const float* m1 = h1 ? h1 + base0 + 100 : nullptr;
+                std::fprintf(stderr,
+                             "TPDUMP tp MOEIN l0 r0=%.9e,%.9e r1=%.9e,%.9e | l1 r0=%.9e,%.9e r1=%.9e,%.9e\n",
+                             (double) m0[0], (double) m0[1], m1 ? (double) m1[0] : 0.0, m1 ? (double) m1[1] : 0.0,
+                             (double) m0[4], (double) m0[5], m1 ? (double) m1[4] : 0.0, m1 ? (double) m1[5] : 0.0);
+            }
+            for (int64_t ll = 0; ll < 2; ++ll) {
+                const double a = (double) h_tpdump_[base0 + 56 + (size_t) ll * 4];
+                const double b = (double) (h1 ? h1[base0 + 64 + (size_t) ll * 4] : 0.0f);
+                std::fprintf(stderr, "TPDUMP tp CMB l%lld r0=%.9e r1=%.9e sum=%.9e\n", (long long) ll, a, b, a + b);
+            }
+            for (int64_t ll = 0; ll < 2; ++ll) {
+                const int32_t* id = (const int32_t*) (h_tpdump_ + (size_t) g_->n_layers * 8 + 72 + (size_t) ll * 8);
+                const float* ww = h_tpdump_ + (size_t) g_->n_layers * 8 + 72 + (size_t) ll * 8 + 4;
+                const int32_t* id1 = h1 ? (const int32_t*) (h1 + (size_t) g_->n_layers * 8 + 72 + (size_t) ll * 8) : nullptr;
+                std::fprintf(stderr, "TPDUMP tp ROUTE l%lld r0=%d,%d,%d,%d w=%.6e,%.6e,%.6e,%.6e r1=%d,%d,%d,%d\n",
+                             (long long) ll, id[0], id[1], id[2], id[3], (double) ww[0], (double) ww[1],
+                             (double) ww[2], (double) ww[3], id1 ? id1[0] : -1, id1 ? id1[1] : -1,
+                             id1 ? id1[2] : -1, id1 ? id1[3] : -1);
+            }
+        }
+        for (int64_t ll = 0; ll < 2; ++ll) {
+            const int32_t* c = (const int32_t*) (h_tpdump_ + (size_t) g_->n_layers * 8 + 88 + (size_t) ll * 4);
+            std::fprintf(stderr, "TPDUMP tp PLAN l%lld hits=%d cpu=%d pcie=%d\n", (long long) ll, c[0], c[1], c[2]);
+        }
+        {
+            const float* h1 = tp_peer_ != nullptr ? tp_peer_->h_tpdump_ : nullptr;
+            const float* q3 = h_tpdump_ + (size_t) g_->n_layers * 8 + 492;
+            const float* q1 = h1 ? h1 + (size_t) g_->n_layers * 8 + 492 : nullptr;
+            const int32_t* sel3 = (const int32_t*) (h_tpdump_ + (size_t) g_->n_layers * 8 + 512);
+            const int32_t* sel1 = h1 ? (const int32_t*) (h1 + (size_t) g_->n_layers * 8 + 512) : nullptr;
+            std::fprintf(stderr,
+                         "TPDUMP tp QSA3 k=%.9e,%.9e v=%.9e,%.9e q=%.9e,%.9e qi=%.9e,%.9e s=%.6e,%.6e sel=%d,%d,%d,%d attn=%.9e,%.9e\n",
+                         (double) q3[0], (double) q3[1], (double) q3[4], (double) q3[5],
+                         (double) q3[8], (double) q3[9], (double) q3[12], (double) q3[13],
+                         (double) q3[16], (double) q3[17],
+                         sel3[0], sel3[1], sel3[2], sel3[3], (double) q3[24], (double) q3[25]);
+            std::fprintf(stderr,
+                         "TPDUMP tp QSA3r1 k=%.9e,%.9e v=%.9e,%.9e q=%.9e,%.9e qi=%.9e,%.9e s=%.6e,%.6e sel=%d,%d,%d,%d attn=%.9e,%.9e\n",
+                         q1 ? (double) q1[0] : 0.0, q1 ? (double) q1[1] : 0.0, q1 ? (double) q1[4] : 0.0, q1 ? (double) q1[5] : 0.0,
+                         q1 ? (double) q1[8] : 0.0, q1 ? (double) q1[9] : 0.0, q1 ? (double) q1[12] : 0.0, q1 ? (double) q1[13] : 0.0,
+                         q1 ? (double) q1[16] : 0.0, q1 ? (double) q1[17] : 0.0,
+                         sel1 ? sel1[0] : -1, sel1 ? sel1[1] : -1, sel1 ? sel1[2] : -1, sel1 ? sel1[3] : -1,
+                         q1 ? (double) q1[24] : 0.0, q1 ? (double) q1[25] : 0.0);
+            const double p0 = (double) h_tpdump_[(size_t) g_->n_layers * 8 + 520];
+            const double p1 = (double) (h1 ? h1[(size_t) g_->n_layers * 8 + 520] : 0.0f);
+            std::fprintf(stderr, "TPDUMP tp L3P r0=%.9e r1=%.9e sum=%.9e\n", p0, p1, p0 + p1);
+            const double m0 = (double) h_tpdump_[(size_t) g_->n_layers * 8 + 524];
+            const double m1 = (double) (h1 ? h1[(size_t) g_->n_layers * 8 + 524] : 0.0f);
+            std::fprintf(stderr, "TPDUMP tp M3 r0=%.9e,%.9e r1=%.9e,%.9e\n", m0,
+                         (double) h_tpdump_[(size_t) g_->n_layers * 8 + 525], m1,
+                         h1 ? (double) h1[(size_t) g_->n_layers * 8 + 525] : 0.0);
+            const float* w0 = h_tpdump_ + (size_t) g_->n_layers * 8 + 528;
+            const float* w1 = h1 ? h1 + (size_t) g_->n_layers * 8 + 528 : nullptr;
+            std::fprintf(stderr,
+                         "TPDUMP tp W3 r0 wk=%.9e,%.9e wv=%.9e,%.9e wq=%.9e,%.9e rk=%.9e,%.9e rv=%.9e,%.9e | r1 wk=%.9e,%.9e wv=%.9e,%.9e\n",
+                         (double) w0[0], (double) w0[1], (double) w0[4], (double) w0[5], (double) w0[8], (double) w0[9],
+                         (double) w0[12], (double) w0[13], (double) w0[16], (double) w0[17],
+                         w1 ? (double) w1[0] : 0.0, w1 ? (double) w1[1] : 0.0, w1 ? (double) w1[4] : 0.0,
+                         w1 ? (double) w1[5] : 0.0);
+            const float* g0 = h_tpdump_ + (size_t) g_->n_layers * 8 + 548;
+            const float* g1 = h1 ? h1 + (size_t) g_->n_layers * 8 + 548 : nullptr;
+            std::fprintf(stderr,
+                         "TPDUMP tp GDN0 r0 q=%.9e,%.9e k=%.9e,%.9e v=%.9e,%.9e h=%.9e,%.9e | r1 q=%.9e,%.9e h=%.9e,%.9e\n",
+                         (double) g0[0], (double) g0[1], (double) g0[4], (double) g0[5], (double) g0[8],
+                         (double) g0[9], (double) g0[12], (double) g0[13],
+                         g1 ? (double) g1[0] : 0.0, g1 ? (double) g1[1] : 0.0,
+                         g1 ? (double) g1[12] : 0.0, g1 ? (double) g1[13] : 0.0);
+        }
+        std::fprintf(stderr, "TPDUMP tp T=%d pos0=%lld", T, (long long) pos0);
+        for (int64_t l = 0; l < g_->n_layers; ++l)
+            std::fprintf(stderr, " %.6e", (double) h_tpdump_[(size_t) l * 8]);
+        std::fprintf(stderr, "\n");
+        std::fprintf(stderr, "TPDUMP tp xm l0=%.6e,%.6e l1=%.6e,%.6e R l0=%.6e,%.6e l1=%.6e,%.6e\n",
+                     (double) h_tpdump_[(size_t) g_->n_layers * 8 + 10], (double) h_tpdump_[(size_t) g_->n_layers * 8 + 11],
+                     (double) h_tpdump_[(size_t) g_->n_layers * 8 + 13], (double) h_tpdump_[(size_t) g_->n_layers * 8 + 14],
+                     (double) h_tpdump_[(size_t) g_->n_layers * 8 + 16], (double) h_tpdump_[(size_t) g_->n_layers * 8 + 17],
+                     (double) h_tpdump_[(size_t) g_->n_layers * 8 + 19], (double) h_tpdump_[(size_t) g_->n_layers * 8 + 20]);
+        std::fprintf(stderr, "TPDUMP tp Rin l0=%0.6e,%0.6e l1=%0.6e,%0.6e\n",
+                     (double) h_tpdump_[(size_t) g_->n_layers * 8 + 28], (double) h_tpdump_[(size_t) g_->n_layers * 8 + 29],
+                     (double) h_tpdump_[(size_t) g_->n_layers * 8 + 31], (double) h_tpdump_[(size_t) g_->n_layers * 8 + 32]);
+        std::fprintf(stderr, "TPDUMP tp bo8 l0=%.9e,%.9e,%.9e,%.9e Rafter l0=%0.6e l1=%0.6e\n",
+                     (double) h_tpdump_[0], (double) h_tpdump_[1], (double) h_tpdump_[2], (double) h_tpdump_[3],
+                     (double) h_tpdump_[(size_t) g_->n_layers * 8 + 46], (double) h_tpdump_[(size_t) g_->n_layers * 8 + 49]);
+        std::fprintf(stderr, "TPDUMP tp Rpost l0=%0.6e l1=%0.6e\n",
+                     (double) h_tpdump_[(size_t) g_->n_layers * 8 + 40], (double) h_tpdump_[(size_t) g_->n_layers * 8 + 43]);
+        std::fprintf(stderr, "TPDUMP tp inj l0=%.6e,%.6e l1=%.6e,%.6e\n",
+                     (double) h_tpdump_[(size_t) g_->n_layers * 8 + 22], (double) h_tpdump_[(size_t) g_->n_layers * 8 + 23],
+                     (double) h_tpdump_[(size_t) g_->n_layers * 8 + 25], (double) h_tpdump_[(size_t) g_->n_layers * 8 + 26]);
+        // STRATA_TP_VEC: the vector dumps as raw fp32, same layout as the solo path's
+        if (const int64_t vat = tp_vec_at(0, 0); vat >= 0) {
+            const int nv = tp_vec_len();
+            static const char* vf = std::getenv("STRATA_TP_VEC_FILE");
+            static int vn = 0;
+            if (vf != nullptr) {
+                // the rank is part of the name: both cards run this block, and site 3 is each card's OWN
+                // pre-allreduce partial, so a shared name would leave whichever rank finished last
+                const std::string path = std::string(vf) + ".tp" + std::to_string(tp_rank_) + "." +
+                                         std::to_string(vn++);
+                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                    for (int64_t l = 0; l <= g_->n_layers; ++l)
+                        for (int site = 0; site < kTpVecSites; ++site)
+                            std::fwrite(h_tpdump_ + tp_vec_at(l, site), sizeof(float), (size_t) nv, f);
+                    std::fclose(f);
+                }
+            }
+        }
+    }
+    ++windows;
+    progress_at("decode");
+    progress_beat();
+    last_t_ = T;
+    last_pos0_ = pos0;
+    // the state advance is this rank's (and the peer's) commit graph
+    // The state advance is NOT done here: the caller commits the tokens it kept (commit -> tp_state_advance),
+    // exactly as the single-card path does.  Advancing here would run the state twice per window.
+    return true;
+}
+
+
+// ---- the pair's single doorbell: rank 1 reads rank 0's plan and flag words.
+//
+// Both cards route the same ids (the router is replicated over the same residual), so one published plan serves
+// both: rank 1 would otherwise need a second pool thread and a second mapped block, and the two could disagree.
+// Rank 0's pool publishes into its mapped plan/sequence/flag words; installing those same host pointers on
+// rank 1 makes its `post` wait on the flags rank 0 raises and read the plan rank 0's pool wrote.
+//
+// The plan's staging pointers address rank 0's mapped staging area, which rank 1 reaches over P2P (enabled by
+// tp_setup_flags).  Rank 1 never writes them.
+void Verifier::tp_share_doorbell(Verifier& src) {
+    h_seq_ = src.h_seq_;
+    m_seq_ = src.m_seq_;
+    h_flagA_ = src.h_flagA_;
+    m_flagA_ = src.m_flagA_;
+    h_flagB_ = src.h_flagB_;
+    m_flagB_ = src.m_flagB_;
+    h_plan_ = src.h_plan_;
+    m_plan_ = src.m_plan_;
+    plan_i32_ = src.plan_i32_;
+    dst2_off_ = src.dst2_off_;
+    // the sink's own view (publish_plan is never used on this rank, but `pcie_mode` and the counts are read)
+    sink_.counts = src.sink_.counts;
+    sink_.start = src.sink_.start;
+    sink_.dst = src.sink_.dst;
+    sink_.tok = src.sink_.tok;
+    sink_.ptr = src.sink_.ptr;
+    sink_.ptr2 = src.sink_.ptr2;
+    sink_.start2 = src.sink_.start2;
+    sink_.dst2 = src.sink_.dst2;
+    sink_.cap = src.sink_.cap;
+    sink_.pcie_mode = src.sink_.pcie_mode;
+    // The plan is read from the mapped host block; its staging addresses are rank 0's device memory.  Keep that
+    // address as `tp_stage0_` and NOT as this rank's `staging_`: with pcie_mode 2 (`auto`, the decode default) each
+    // rank stages its OWN half of the miss blobs into its OWN `staging_` over its OWN PCIe link, so the two x8
+    // links carry the fetch in parallel (a whole-blob fetch on one link was 0.42 ms/expert; half a blob on each is
+    // ~0.21).  `tp_stage0_` is only what the host-DMA modes (pcie_mode 0/1) point this rank's plan at, since there
+    // rank 0 stages for the pair and this card reads that area over P2P.  NVLink keeps its role unchanged: the
+    // resident experts live in rank 0's arena and this rank reads its half of them over P2P.
+    tp_stage0_ = src.staging_;
+}
+
+// ---- The TP commit graph: this rank's GDN conv history + recurrence advance by the window's kept tokens, plus
+// the (replicated) QSA tail restore and indexer append.  The ordinary commit graph advances whole 48-head
+// layers, which is exactly what a TP rank must not do: its GDN state holds the LOCAL v-heads only.
+bool Verifier::capture_commit_tp(std::string& err) {
+    if (tp_commit_exec_ != nullptr) return true;
+    const OnDevice on_self(device_);   // the coordinator may call this on the peer's verifier
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const QsaShapes s = shapes_of(g);
+    const int64_t Ct = strata::core::kTpGdnConvChannels;
+    const int64_t HVt = g.ssm_v_heads / 2;
+    const int64_t MT = max_t_;
+    const int64_t S = g.ssm_state_size;
+    const int64_t TS = (s.idx_block - 1) * g.idx_key_dim;
+    const int64_t ID = g.idx_key_dim;
+    const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
+    const int64_t conv_off = S * HVt * S;   // the local conv history starts after the local recurrent state
+    if (gdn_state_tp_ == nullptr) { err = "verify: tp: capture_commit_tp before tp_setup_scratch"; return false; }
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = "verify: tp: begin commit capture failed";
+        return false;
+    }
+    bool ok = true;
+    try {
+        copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
+        // the GDN layers' local state, one launch for the conv histories and one for the recurrences
+        int64_t gdn_index = 0;
+        for (int64_t l = 0; l < lb_; ++l) if (!is_qsa_layer(g, l)) ++gdn_index;
+        int64_t n_gdn = 0;
+        bool norms_ok = true;
+        for (int64_t l = lb_; l < le_ && norms_ok; ++l)
+            if (!is_qsa_layer(g, l)) {
+                ++n_gdn;
+                norms_ok = need(LayerView(*wt_, l), "ssm_norm.weight", err) != nullptr;
+            }
+        if (!norms_ok) ok = false;
+        else if (n_gdn > 0) {
+            // the batched form only takes the split-free kernels; otherwise the per-layer pair below
+            const bool batched = gdn_commit_layers(
+                gdn_state_tp_ + (size_t) gdn_index * gdn_state_tp_floats_, gdn_state_tp_floats_, conv_off,
+                qkv_tp_ + (size_t) gdn_index * MT * Ct, MT * Ct, h_tp_ + (size_t) gdn_index * MT * Ct, MT * Ct,
+                gate_tp_ + (size_t) gdn_index * MT * HVt, beta_tp_ + (size_t) gdn_index * MT * HVt, MT * HVt, (int) Ct,
+                (int) g.ssm_k_heads, (int) HVt, (int) MT, (int) n_gdn, commit_, cs_);
+            if (!batched) {
+                int64_t gi = gdn_index;
+                for (int64_t l = lb_; l < le_ && ok; ++l) {
+                    if (is_qsa_layer(g, l)) continue;
+                    const WeightRef* wnm = need(LayerView(*wt_, l), "ssm_norm.weight", err);
+                    if (!wnm) { ok = false; break; }
+                    float* state = gdn_state_tp_ + (size_t) gi * gdn_state_tp_floats_;
+                    float* conv = state + conv_off;
+                    gdn_conv_commit(conv, qkv_tp_ + (size_t) gi * MT * Ct, (int) Ct, commit_, cs_);
+                    // the TP recurrence's commit: the local heads, the global head offset
+                    gdn_step_norm_multi_tp(state, h_tp_ + (size_t) gi * MT * Ct, (int) Ct,
+                                           gate_tp_ + (size_t) gi * MT * HVt, beta_tp_ + (size_t) gi * MT * HVt, z_tp_,
+                                           (const float*) wnm->data, EPS, y_dummy_, (int) g.ssm_k_heads, (int) HVt,
+                                           (int) MT, commit_, cs_, (int) MT, nullptr, (int) (tp_rank_ * HVt));
+                    ++gi;
+                }
+            }
+        }
+        // the QSA layers' tail restore and indexer append (replicated: every card keeps its own full cache)
+        int64_t qsa_index = 0;
+        for (int64_t l = 0; l < lb_; ++l) if (is_qsa_layer(g, l)) ++qsa_index;
+        for (int64_t l = lb_; l < le_ && ok; ++l) {
+            if (!is_qsa_layer(g, l)) continue;
+            const QsaState& st = ss.qsa_states[qsa_index];
+            const WeightRef* wikn = need(LayerView(*wt_, l), "indexer.k_norm.weight", err);
+            if (!wikn) { ok = false; break; }
+            copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
+            const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+            if (!g_no_batch_kv) {
+                native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT, 0,
+                                                (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
+            } else {
+                for (int64_t t = 0; t < MT; ++t)
+                    native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
+                                              (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
+            }
+            ++qsa_index;
+        }
+        // The PLE history rewind.  The layer-1 block above advances `ss.ple.hist` once per token in the window
+        // (`ple_history_advance`, verify.cpp:3773), but the commit keeps only `commit_ + 1` of those rows - so
+        // without this the NEXT window convolves its 4 taps over a history that runs T - (commit_ + 1) rows too
+        // far ahead.  The first window is right only because the prefill's own commit already left the history
+        // at the kept row; every window after it is wrong.  Solo does exactly this at verify.cpp:3300, from the
+        // same snapshot (`hist_snap_`, written per row at 3778).  Restoring before that guard was in place fed
+        // speculative rows back in and changed the tokens, which is why this line was once removed - the
+        // snapshot is now only reachable for the rows the commit actually keeps.
+        if (ok && ss.ple.ready() && ple_stage()) copy_indexed(ss.ple.hist, hist_snap_, HS, commit_ + 1, HS, cs_);
+    } catch (const std::exception& e) {
+        ok = false;
+        err = std::string("verify: tp commit: ") + e.what();
+    }
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    if (!ok) {
+        if (graph) cudaGraphDestroy(graph);
+        return false;
+    }
+    if (ce != cudaSuccess) {
+        err = "verify: tp: end commit capture: " + std::string(cudaGetErrorString(ce));
+        return false;
+    }
+    const bool made = instantiate_evicting(tp_commit_exec_, graph, {}, "verify: tp: commit instantiate: ", err);
+    cudaGraphDestroy(graph);
+    if (!made) return false;
+    if (cudaGraphUpload(tp_commit_exec_, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: tp: the commit graph could not be uploaded";
+        return false;
+    }
+    return true;
+}
+
+// ---- the state advance after a TP window: both cards' GDN state and the replicated QSA caches
+bool Verifier::tp_state_advance(int n_keep, std::string& err) {
+    if (n_keep < 1 || n_keep > last_t_) { err = "verify: tp commit count out of range"; return false; }
+    if (tp_commit_exec_ == nullptr) { err = "verify: tp commit graph was never captured"; return false; }
+    const OnDevice on_self(device_);
+    h_commit_[0] = n_keep;
+    h_commit_[1] = n_keep - 1;
+    for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+    if (tp_peer_ == nullptr) { err = "verify: tp_state_advance without a peer"; return false; }
+    tp_peer_->h_commit_[0] = h_commit_[0];
+    tp_peer_->h_commit_[1] = h_commit_[1];
+    for (int t = 0; t < tp_peer_->max_t_; ++t) tp_peer_->h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    const cudaError_t le = cudaGraphLaunch(tp_commit_exec_, cs_);
+    if (le != cudaSuccess) { err = std::string("verify: tp commit launch: ") + cudaGetErrorString(le); return false; }
+    {
+        const OnDevice on_peer(tp_peer_->device_);
+        const cudaError_t pe = cudaGraphLaunch(tp_peer_->tp_commit_exec_, tp_peer_->cs_);
+        if (pe != cudaSuccess) { err = std::string("verify: tp peer commit launch: ") + cudaGetErrorString(pe); return false; }
+    }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify: tp commit failed"; return false; }
+    {
+        const OnDevice on_peer(tp_peer_->device_);
+        if (cudaStreamSynchronize(tp_peer_->cs_) != cudaSuccess) { err = "verify: tp peer commit failed"; return false; }
+    }
+    // The PLE history's last two tokens: `commit` forwards here and returns, so the advance its own tail does
+    // (see the `ple_stage()` block there) has to happen on this path too - otherwise every window hashes its
+    // n-gram rows from a stale pair and layer 1 reads the wrong PLE rows.  Both ranks hash their own window, so
+    // both histories advance.
+    if (ple_stage()) {
+        for (int t = 0; t < n_keep; ++t) {
+            ss_->ple_prev[0] = ss_->ple_prev[1];
+            ss_->ple_prev[1] = last_tokens_[t];
+            if (tp_peer_->ple_stage()) {
+                tp_peer_->ss_->ple_prev[0] = tp_peer_->ss_->ple_prev[1];
+                tp_peer_->ss_->ple_prev[1] = last_tokens_[t];
+            }
+        }
+    }
+    return true;
+}
+
+namespace {
+// set_commit_async (--serve): commit() launches the commit graph and returns without waiting for it; wait_commit
+// polls the event it recorded.  Off by default (one commit at a time, synchronously).
+bool g_commit_async = false;
+}  // namespace
+
+void Verifier::set_commit_async(bool on) { g_commit_async = on; }
 
 bool Verifier::commit(int n_keep, std::string& err) {
 #if defined(STRATA_GPU_METAL)
     return strata::metal_engine::window_commit(metal_, n_keep, err);
 #endif
+    // --tp: this rank's state is split (the GDN half lives in the tp arena), so the ordinary commit graph -
+    // which advances whole 48-head layers - would be wrong.  The pair's commit graphs advance both halves.
+    // (A rank whose TP window path never ran has no captured pair graph; STRATA_TP_SOLO=1 keeps this verifier on
+    // the ordinary `run`, so it must not be routed here - see the tp_commit_exec_ check below.)
+    if (tp_on() && tp_rank() == 0 && tp_peer_ != nullptr && tp_commit_exec_ != nullptr)
+        return tp_state_advance(n_keep, err);
+    if (tp_on() && tp_commit_exec_ != nullptr) {
+        err = "verify: commit on a TP rank other than the coordinator";
+        return false;
+    }
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
     const Clock::time_point t0 = Clock::now();
@@ -3301,8 +6089,8 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     const bool made = instantiate_evicting(ex, graph, bkey(rows, S, hbase), "verify: batch instantiate: ", err);
     cudaGraphDestroy(graph);
     if (!made) return false;
-    cudaGraphUpload(ex, cs_);
-    cudaStreamSynchronize(cs_);
+    if (cudaGraphUpload(ex, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess)
+        (void) cudaGetLastError();   // only a warm-up: the first launch uploads it (see capture)
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
     std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
@@ -3453,6 +6241,8 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
 }
 
 int Verifier::drop_solo_graphs() {
+    // the caller may stand on the other card's device (§8.3-3d switches the kernel between requests): enter ours
+    const OnDevice on_self(device_);
     // --pipeline-windows prepares its graphs once (capture_all) and never captures them again: those stay
     if (ev_done_ != nullptr || cudaStreamSynchronize(cs_) != cudaSuccess) return 0;
     int n = 0;
@@ -3464,8 +6254,122 @@ int Verifier::drop_solo_graphs() {
     return n;
 }
 
+// STRATA_GRAPH_PRIO: the capture-time notes.  A fork note keeps cs's current tail (the node the branch's first kernel
+// will depend on); a tail note keeps a priority stream's current tail and the priority its nodes should run at
+// (1 = the device's highest, -1 = its lowest).  No-ops with the switch off, outside a capture, and on HIP / Metal.
+void Verifier::note_prio_fork(cudaStream_t from) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    if (!graph_prio_on()) return;
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    const cudaGraphNode_t* deps = nullptr;
+    size_t nd = 0;
+    if (prio_capture_deps(from, &st, &deps, &nd) != cudaSuccess || st != cudaStreamCaptureStatusActive) {
+        (void) cudaGetLastError();
+        return;
+    }
+    for (size_t i = 0; i < nd; ++i) prio_forks_.push_back(deps[i]);
+#else
+    (void) from;
+#endif
+}
+
+void Verifier::note_prio_tail(cudaStream_t on, int prio) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    if (!graph_prio_on()) return;
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    const cudaGraphNode_t* deps = nullptr;
+    size_t nd = 0;
+    if (prio_capture_deps(on, &st, &deps, &nd) != cudaSuccess || st != cudaStreamCaptureStatusActive) {
+        (void) cudaGetLastError();
+        return;
+    }
+    for (size_t i = 0; i < nd; ++i) prio_tails_.push_back({deps[i], prio});
+#else
+    (void) on; (void) prio;
+#endif
+}
+
+// STRATA_GRAPH_PRIO: what priorities the captured kernel nodes carry (a histogram, logged once per window graph).  If the
+// capture copied none from the streams (some drivers read back 0 everywhere), each priority stream's nodes are found by
+// walking its noted tails back to the noted forks and the attribute is set per node.
+void Verifier::apply_node_priorities(cudaGraph_t graph, int T) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    int lo = 0, hi = 0;
+    if (cudaDeviceGetStreamPriorityRange(&lo, &hi) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    auto histogram = [&](std::map<int, int>& h) {
+        size_t nn = 0;
+        cudaGraphGetNodes(graph, nullptr, &nn);
+        std::vector<cudaGraphNode_t> nodes(nn);
+        cudaGraphGetNodes(graph, nodes.data(), &nn);
+        h.clear();
+        for (cudaGraphNode_t nd : nodes) {
+            cudaGraphNodeType ty;
+            if (cudaGraphNodeGetType(nd, &ty) != cudaSuccess || ty != cudaGraphNodeTypeKernel) continue;
+            cudaKernelNodeAttrValue v{};
+            if (cudaGraphKernelNodeGetAttribute(nd, cudaKernelNodeAttributePriority, &v) == cudaSuccess) ++h[v.priority];
+            else { (void) cudaGetLastError(); ++h[999]; }
+        }
+    };
+    std::map<int, int> h;
+    histogram(h);
+    bool captured = false;
+    for (auto& [p, c] : h) captured = captured || (p != 0 && p != 999 && c > 0);
+    int repaired = 0, walked_forks = (int) prio_forks_.size(), walked_tails = (int) prio_tails_.size();
+    if (!captured && !prio_tails_.empty()) {   // the fallback: per node from the capture-time notes
+        std::set<cudaGraphNode_t> stop(prio_forks_.begin(), prio_forks_.end()), seen;
+        for (auto& [tail, pr] : prio_tails_) {
+            std::vector<cudaGraphNode_t> stack{tail};
+            while (!stack.empty()) {
+                cudaGraphNode_t nd = stack.back();
+                stack.pop_back();
+                if (stop.count(nd) || !seen.insert(nd).second) continue;
+                cudaGraphNodeType ty;
+                if (cudaGraphNodeGetType(nd, &ty) == cudaSuccess && ty == cudaGraphNodeTypeKernel) {
+                    cudaKernelNodeAttrValue v{};
+                    v.priority = pr > 0 ? hi : lo;
+                    if (cudaGraphKernelNodeSetAttribute(nd, cudaKernelNodeAttributePriority, &v) == cudaSuccess) ++repaired;
+                    else (void) cudaGetLastError();
+                }
+                size_t nd_n = 0;
+                prio_node_deps(nd, nullptr, &nd_n);
+                std::vector<cudaGraphNode_t> deps(nd_n);
+                if (nd_n > 0 && prio_node_deps(nd, deps.data(), &nd_n) == cudaSuccess)
+                    for (size_t i = 0; i < nd_n; ++i) stack.push_back(deps[i]);
+                else (void) cudaGetLastError();
+            }
+        }
+        histogram(h);
+    }
+    std::string s;
+    for (auto& [p, c] : h) s += " " + std::to_string(c) + " x prio " + (p == 999 ? std::string("?") : std::to_string(p)) + ";";
+    std::fprintf(stderr, "strata verify: the %d-token window's kernel node priorities (range %d..%d):%s %s (%d forks, %d tails noted%s)\n",
+                 T, lo, hi, s.c_str(), captured ? "captured from the streams" : "NOT captured from the streams",
+                 walked_forks, walked_tails, repaired > 0 ? (", " + std::to_string(repaired) + " nodes set from the notes").c_str() : "");
+#else
+    (void) graph; (void) T;
+#endif
+}
+
+bool Verifier::evict_window_graph(int keep_t, bool& evicted, std::string& err) {
+    evicted = false;
+    if (no_window_eviction_ || keep_t < 1) return true;
+    bool have[9] = {};
+    for (int t = 1; t <= max_t_ && t < 9; ++t) have[t] = (ar_off_ ? exec_nr_[t] : exec_[t]) != nullptr;
+    const int victim = strata::core::pick_window_victim(have, std::min(max_t_, 8), keep_t, prelaunched_);
+    if (victim == 0) return true;
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: synchronizing before window graph eviction failed";
+        return false;
+    }
+    cudaGraphExec_t& e = ar_off_ ? exec_nr_[victim] : exec_[victim];
+    cudaGraphExecDestroy(e);
+    e = nullptr;   // capture() re-captures it on that size's next use
+    evicted = true;
+    return true;
+}
+
 bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key,
-                                   const char* what, std::string& err) {
+                                   const char* what, std::string& err, int keep_t, unsigned long long flags) {
     // #997: every layout of active slots keeps its own graph pair (20-30 MiB each on an L40S), and with an expert cache
     // sized to the reserve the next window graph - a batch layout or a one-request window captured on first use - can
     // find no VRAM left: free the least recently used layouts until it fits (they are captured again when needed)
@@ -3478,12 +6382,12 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     static int test_left = test_oom;
     auto inst = [&]() -> cudaError_t {
         if (test_left > 0 && !exec_bm_.empty() && !key.empty()) { --test_left; return cudaErrorMemoryAllocation; }
-        const cudaError_t e = cudaGraphInstantiate(&ex, graph, 0);
+        const cudaError_t e = cudaGraphInstantiate(&ex, graph, flags);
         if (e != cudaSuccess) ex = nullptr;
         return e;
     };
     cudaError_t ie = inst();
-    int freed = 0, solo = 0;
+    int freed = 0, solo = 0, win = 0;
     size_t relief = 0;
     for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted;) {
         (void) cudaGetLastError();
@@ -3497,6 +6401,17 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
         (void) cudaGetLastError();
         if ((solo = drop_solo_graphs()) > 0) ie = inst();
     }
+    // #3702: a single-request window's graph that still does not fit frees the graphs of the other window sizes - the
+    // larger ones first: they cost the most VRAM and are asked for least often, and each is captured again when its size
+    // is next used.  Cheaper than taking the expert cache's slots below (that costs the hit rate).
+    for (int w = 0; ie == cudaErrorMemoryAllocation && w < max_t_; ++w) {
+        bool evicted = false;
+        (void) cudaGetLastError();
+        if (!evict_window_graph(keep_t, evicted, err)) return false;
+        if (!evicted) break;
+        ++win;
+        ie = inst();
+    }
     for (int r = 0; ie == cudaErrorMemoryAllocation && vram_relief_ && r < 8; ++r) {
         (void) cudaGetLastError();
         if (cudaStreamSynchronize(cs_) != cudaSuccess) break;
@@ -3505,14 +6420,15 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
         relief += got;
         ie = inst();
     }
-    if (freed > 0 && solo == 0 && relief == 0)
+    if (freed > 0 && solo == 0 && win == 0 && relief == 0)
         std::fprintf(stderr, "strata verify: no VRAM for a new window graph: freed the graphs of %d older batch slot "
                              "layouts, %zu kept (a larger --vram-reserve-mib keeps more)\n", freed, exec_bm_.size());
-    else if ((solo > 0 || relief > 0) && !graph_oom_said_) {
+    else if ((solo > 0 || win > 0 || relief > 0) && !graph_oom_said_) {
         graph_oom_said_ = true;   // once: later ones are the same story
         std::fprintf(stderr, "strata verify: no VRAM for a new window graph: freed %d batch layouts, %d solo window "
-                             "graphs and %zu MiB of the expert cache%s (said once; a larger --vram-reserve-mib avoids it)\n",
-                     freed, solo, relief >> 20, ie == cudaSuccess ? "" : " - still not enough");
+                             "graphs, %d window sizes and %zu MiB of the expert cache%s (said once; a larger "
+                             "--vram-reserve-mib avoids it)\n",
+                     freed, solo, win, relief >> 20, ie == cudaSuccess ? "" : " - still not enough");
     }
     if (ie != cudaSuccess) {
         err = std::string(what) + cudaGetErrorString(ie);
@@ -4002,6 +6918,14 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
 
 bool Verifier::capture_all(std::string& err) {
     const OnDevice on_device(device_);
+    // every size 1..max_t is captured here and all of them are needed: making room for one by freeing another's graph
+    // would only move the failure one size further (and leave it uncaptured for the pipelined path)
+    struct NoEvict {
+        bool& flag;
+        bool prev;
+        explicit NoEvict(bool& f) : flag(f), prev(f) { flag = true; }
+        ~NoEvict() { flag = prev; }
+    } no_evict(no_window_eviction_);
     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
     if (remote_opt_ != nullptr) { err = "verify: pipelined windows do not serve --remote-expert-opt"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
@@ -4090,6 +7014,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     if (cudaEventRecord(ev_done_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
     (void) cudaStreamQuery(cs_);   // WDDM: submit now
     fl_active_ = true;
+    pcie_drained_ = false;   // the replayed graph restamps every pair: this window's read-back is still to come
     fl_since_ms_ = fl_flush_ms_ = fl_launch_ms_ = now_ms();
     return true;
 }
@@ -4204,6 +7129,10 @@ bool Verifier::done(std::string& err) {
         if (cudaStreamQuery(copy_) == cudaErrorNotReady) return false;
         copy_used_ = false;
     }
+    if (!pcie_drained_) {   // ev_done_ says the window's graph finished: its H2D stamps are final (STRATA_PCIE_TIMING)
+        drain_pcie_timing();
+        pcie_drained_ = true;
+    }
     return true;
 }
 
@@ -4264,8 +7193,10 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
 
 void Verifier::absorb_stats(Verifier& o) {
     ms_wait += o.ms_wait; ms_pool += o.ms_pool; ms_host += o.ms_host; ms_commit += o.ms_commit;
+    ms_pcie += o.ms_pcie;   // the report sums both parities until this absorbs one into the other: keep it exact
     windows += o.windows;
     o.ms_wait = o.ms_pool = o.ms_host = o.ms_commit = 0;
+    o.ms_pcie = 0;
     o.windows = 0;
     for (int k = 0; k < 2; ++k)
         for (int i = 0; i < kProfPer; ++i) { prof_sum_[k][i] += o.prof_sum_[k][i]; o.prof_sum_[k][i] = 0; }

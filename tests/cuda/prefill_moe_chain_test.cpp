@@ -258,6 +258,9 @@ int main() {
             fails += in_place_case(GGML_TYPE_NVFP4, 1280, 2560, group, 11);   // gate/up
             fails += in_place_case(GGML_TYPE_NVFP4, 2560, 640, group, 12);    // down (w4a8)
             fails += in_place_case(GGML_TYPE_NVFP4, 2560, 640, {1, 33}, 13);
+            fails += in_place_case(GGML_TYPE_NVFP4, 640, 2560, group, 31);    // TP local gate/up
+            fails += in_place_case(GGML_TYPE_NVFP4, 1280, 640, group, 32);    // TP output-row down
+            fails += in_place_case(GGML_TYPE_NVFP4, 1280, 640, {1, 2, 5, 64}, 33);
         }
         if (mmq::token_rows_ok((int) GGML_TYPE_NVFP4, 2560)) {
             fails += token_rows_case(group, 400, 21);

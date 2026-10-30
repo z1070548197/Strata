@@ -20,6 +20,14 @@ uint64_t vmm_granularity();
 VmmChunk vmm_chunk_new(int dev);
 void vmm_chunk_free(VmmChunk h);
 
+/// A second device that must be able to read/write every VMM range (default -1: none).  A mapped range is
+/// granted the owning device plus device 0 - the peer-expert tier's path.  A tensor-parallel pair is the other
+/// way round: rank 1 reads rank 0's expert arena directly, and a range created on device 0 that is not granted
+/// to device 1 faults with an illegal access the moment rank 1's expert kernel touches it.  Set before the
+/// ranges are committed (--tp: at startup, to the peer device).
+void vmm_set_peer_device(int dev);
+int vmm_peer_device();
+
 class VmmRange {
 public:
     VmmRange() = default;

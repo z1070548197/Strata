@@ -1369,7 +1369,28 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                  int64_t ldy, float beta, int64_t ldx) {
+                  int64_t ldy, float beta, int64_t ldx, const PeerRows* peer) {
+    // --tp: this card holds HALF of this matrix (it was uploaded with its rank's split, NativeDense::tp_peer_rows says
+    // where the other half is).  Every dequantization below therefore pulls its row range from the half that owns it,
+    // so the scratch holds the full matrix in the full matrix's own row order - and the GEMM that follows is the very
+    // call a single card makes over the full N.  That is deliberate: assembling the matrix and running one GEMM, rather
+    // than running a GEMM per half into two halves of Y, is what makes the prompt path bit-identical to the single
+    // card's output (same N, same scratch layout, same reduction per element).
+    // Reading rows [0, n_own) from W_blocks and the rest from the peer is expressed once, here, because all three
+    // dequant sites below (the padded-X path, the row-sliced loop, the whole-matrix call) must do it identically.
+    const auto dequant_rows = [&](int64_t r0, int64_t n, uint16_t* out) {
+        if (peer == nullptr || r0 + n <= peer->n_own) {
+            strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, out, stream_);
+            return;
+        }
+        if (r0 >= peer->n_own) {
+            strata::kernels::dequant_f16(ggml_type, peer->blocks, peer->src_row0 + (r0 - peer->n_own), n, K, out, stream_);
+            return;
+        }
+        const int64_t own = peer->n_own - r0;   // the range straddles the two halves
+        strata::kernels::dequant_f16(ggml_type, W_blocks, r0, own, K, out, stream_);
+        strata::kernels::dequant_f16(ggml_type, peer->blocks, peer->src_row0, n - own, K, out + own * K, stream_);
+    };
 #ifdef STRATA_USE_HIP
     // S23 (opt-in STRATA_PF_PAD=1, with STRATA_PF_GEMM=1 on chunks of STRATA_PF_SWITCH_MIN_T+ tokens): the weight
     // dequantized into the scratch with row stride K + 64 halves, so no 4 KB-multiple stride camps on the memory
@@ -1379,7 +1400,8 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     static const int64_t pf_min_t = [] { const char* v = std::getenv("STRATA_PF_SWITCH_MIN_T"); return v ? (int64_t) std::atoll(v) : (int64_t) 0; }();
     if (pad_on && pf_on && T >= pf_min_t && T >= 64 && N >= 512 && K % 32 == 0 && N * (K + 64) <= scratch_elems_) {
         const int64_t ldw = K + 64;
-        if (strata::kernels::dequant_f16_ld(ggml_type, W_blocks, 0, N, K, ldw, scratch_, stream_) &&
+        // not with a peer: dequant_f16_ld takes the whole matrix from one buffer, and this card holds half of it
+        if (peer == nullptr && strata::kernels::dequant_f16_ld(ggml_type, W_blocks, 0, N, K, ldw, scratch_, stream_) &&
             strata_pf_gemm_f16_ld(X, ldx > 0 ? ldx : K, scratch_, ldw, Y, T, N, K, ldy, beta, stream_)) {
             return;
         }
@@ -1394,7 +1416,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; ok && r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
-            strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
+            dequant_rows(r0, n, scratch_);
             ok = strata_pf_gemm_f16_ld(X, ldx, scratch_, K, Y + r0, T, n, K, ldy, beta, stream_);
         }
         if (ok) return;
@@ -1404,7 +1426,8 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         std::exit(1);
     }
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
-    if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
+    // not with a peer: native_mmq dequantizes the matrix itself and would read this rank's half as if it were whole
+    if (peer == nullptr && beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
 #endif
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
@@ -1413,12 +1436,12 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
-            strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
+            dequant_rows(r0, n, scratch_);
             f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
         }
         return;
     }
-    strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+    dequant_rows(0, N, scratch_);
     f16(X, scratch_, Y, T, N, K, ldy, beta);
 }
 

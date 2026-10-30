@@ -338,9 +338,31 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     }
 }
 
+// A failed launch, with what it was asked to read and where each pointer lives.  `cudaGetErrorString` alone cannot
+// say the one thing that matters here: an illegal access on a weight whose bytes are on the OTHER card reads out of
+// range on this one, and only the pointers' devices show that.
+void dq_fail(const char* site, int type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, int64_t ld,
+             const void* out, void* stream, void* caller, cudaError_t e) {
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) cudaGetLastError();
+    cudaPointerAttributes pb{}, po{};
+    const cudaError_t eb = cudaPointerGetAttributes(&pb, blocks);
+    const cudaError_t eo = cudaPointerGetAttributes(&po, out);
+    (void) cudaGetLastError();
+    std::fprintf(stderr,
+                 "dequant launch: %s [%s type %d row0 %lld rows %lld cols %lld ld %lld]\n"
+                 "  blocks %p (%s -> type %d dev %d)\n"
+                 "  out    %p (%s -> type %d dev %d)\n"
+                 "  device %d, stream %p, caller %p\n",
+                 cudaGetErrorString(e), site, type, (long long) row0, (long long) rows, (long long) cols,
+                 (long long) ld, blocks, cudaGetErrorString(eb), (int) pb.type, pb.device, out,
+                 cudaGetErrorString(eo), (int) po.type, po.device, dev, stream, caller);
+}
+
 template <typename T>
 void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, T* out, void* stream,
             int64_t ld = 0) {
+    void* const caller = __builtin_return_address(0);
     int be = 0, bb = 0;
     if (!geometry(type, be, bb) || cols % be != 0 || rows <= 0) {
         std::fprintf(stderr, "dequant: unsupported type %d or shape %lld x %lld\n", type, (long long) rows,
@@ -356,7 +378,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
         (reinterpret_cast<uintptr_t>(out) & 15) == 0) {   // contiguous rows only (the kernel writes out + g * 32)
         dequant_q8_0_kernel<T><<<(unsigned) ((4 * total + 255) / 256), 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out);
         const cudaError_t e = cudaGetLastError();
-        if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+        if (e != cudaSuccess) { dq_fail("q8_0", type, blocks, row0, rows, cols, cols, out, stream, caller, e); std::exit(1); }
         return;
     }
     // the wide kernels: even block addresses, 16-byte stores at every row (contiguous or a stride of whole stores)
@@ -372,7 +394,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
         }
 #undef STRATA_DQW
         const cudaError_t e = cudaGetLastError();
-        if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+        if (e != cudaSuccess) { dq_fail("wide", type, blocks, row0, rows, cols, ld, out, stream, caller, e); std::exit(1); }
         return;
     }
     // sm_75 (and only cc 7.5) takes the vectorised-store form when every group's 32 outputs start on 16 bytes (an
@@ -403,7 +425,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     }
 #undef STRATA_DQ
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) { dq_fail("plain", type, blocks, row0, rows, cols, ld, out, stream, caller, e); std::exit(1); }
 }
 
 }  // namespace

@@ -60,14 +60,29 @@ void gr_broadcast(const float* e, float* R, int64_t T, void* stream);
 // ---- GDN (state 128, 16 k heads, 48 v heads, 10240 conv channels, 4 taps)
 /// gate[t,h] = softplus(ab[t,h] + dt[h]) * ssm_a[h];  beta[t,h] = sigmoid(ab[t, 48 + h])  (ab: [T, 96])
 void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta, int64_t T, void* stream);
+void gdn_gates_local(const float* ab, const float* dt, const float* ssm_a, float* gate, float* beta,
+                     int h_v, int head_offset, int64_t T, void* stream);
 /// The 4-tap causal conv + SiLU over the chunk (history [C][3] in, updated to the chunk's last three inputs), then
 /// the L2 norm of the q and k heads of every token.  h: [T, C].
 void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream);
+/// Rank-local TP variant: q/k stay replicated while v channels are local.  The
+/// history is advanced in place for this rank and q/k use the same 128-wide L2
+/// reduction as the full kernel.
+void gdn_conv_local(float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
+                    int64_t T, float eps, void* stream);
 /// The recurrence over the chunk, state in registers; y16[t] = rmsnorm(o) * gamma * sigmoid(z) in FP16 (what the
 /// out projection reads); y is FP32 scratch.
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream,
                     int64_t ld16 = 0);   // ld16: y16's row stride (0 = 6144; S23 STRATA_PF_PAD pads it)
+void gdn_recurrence_local(float* state, const float* h, int channels, const float* gate, const float* beta,
+                          const float* z, const float* gamma, float eps, float* y, uint16_t* y16,
+                          int h_k, int h_v, int head_offset, int64_t T, void* stream, int64_t ld16 = 0);
+/// Canonical full-width GDN recurrence executed as the same two 24-head launches used by TP.  State and all
+/// token-major inputs/outputs retain their full 48-head pitch, so no state copy or repacking is involved.
+void gdn_recurrence_tp_canonical(float* state, const float* h, const float* gate, const float* beta,
+                                 const float* z, const float* gamma, float eps, float* y, uint16_t* y16,
+                                 int64_t T, void* stream, int64_t ld16 = 0);
 /// The kernels behind gdn_recurrence, for the parity test: 0 = the column-split kernels + the norm kernel (or the
 /// one-block-per-head kernel under STRATA_GDN_REC_HEADS), 1 = four lanes per column (no barrier per token) + the grid-stride norm, 2 = the
 /// one-block-per-head kernel (its fused norm rounds differently).  0 and 1 give the same bits.  On HIP, 0 and 1 run the opt-in
@@ -98,6 +113,13 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream, const float* row_sd = nullptr);
+/// moe_combine on one block of output columns: bo[t, d] = shared[t, shared_off + d] * sigmoid(sg[t]) +
+/// sum_k w[t, k] * D[slot[t, k], d] for d in [0, cols), with D's rows read from column 0 (a TP rank's compact down
+/// output) and `shared` a row `shared_ld` wide.  Per column the expression is the one moe_combine uses, so one block
+/// per rank plus a stitch of the blocks is bitwise moe_combine over [0, N).
+void moe_combine_cols(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                      float* bo, int64_t T, int64_t cols, int64_t shared_ld, int64_t shared_off, int64_t bo_ld,
+                      void* stream, const float* row_sd = nullptr);
 /// --peer-device's prompt share as sums: bo[t, :] = (sum over the k with slot[t, k] < rows_local of w[t, k] *
 /// D[slot[t, k], :], in k order) + peer[t, :] + shared[t, :] * sigmoid(sg[t]).  `peer` (the peer's per-token sums)
 /// may be mapped host memory.
@@ -150,6 +172,7 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
 /// fp32 -> fp16 bits and fp32 -> bf16, n elements (the two activation images of the prompt GEMMs).
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
 void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo = nullptr);
+void to_bf16_strided(const float* x, uint16_t* y, int64_t rows, int64_t cols, int64_t ldx, void* stream);
 /// y = fp32(fp16(x)): what an FP16 store of x would read back (the FP16 indexer-key experiment)
 void round_f16(const float* x, float* y, int64_t n, void* stream);
 /// Expert blob -> FP16 (Q2_0 values are exact in FP16).
